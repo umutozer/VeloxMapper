@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net8.0;net9.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <IsPackable>false</IsPackable>
+
+    <!-- NuGet paket meta bilgileri -->
+    <PackageId>VeloxMapper.Core</PackageId>
+    <Version>5.2.1</Version>
+    <Authors>Umut Ozer</Authors>
+    <Description>VeloxMapper core abstractions, attributes, exceptions and caching primitives. High-performance, deterministic, NativeAOT-compatible object mapping library.</Description>
+    <PackageTags>mapping;object-mapper;source-generator;nativeaot</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/umuto/VeloxMapper</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!--
+    ⚠️ MİMARİ NOT: Generator referansı burada YOKTUR.
+    
+    Neden: VeloxMapper.Generators projesi VeloxMapper.Core'a bağımlıdır (attribute türlerini okumak için).
+           Eğer Core da Generators'a referans verirse → dairesel bağımlılık (circular dependency) oluşur.
+    
+    Çözüm: Generator, ANA tüketici paketi (VeloxMapper) içinden referans verilir.
+    Böylece bağımlılık grafiği:
+    
+      VeloxMapper.Generators → VeloxMapper.Core (compile-time, PrivateAssets=all)
+      VeloxMapper             → VeloxMapper.Core (runtime)
+      VeloxMapper             → VeloxMapper.Generators (analyzer, ReferenceOutputAssembly=false)
+    
+    NuGet paketleme stratejisi:
+      - VeloxMapper.Core.nupkg → Sadece abstractions, attributes, exceptions (bağımsız paket)
+      - VeloxMapper.nupkg → Runtime engine + Generator embed (ana paket)
+  -->
+
+</Project>

@@ -1,0 +1,99 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <!-- NuGet paket meta bilgileri -->
+    <PackageId>VeloxMapper</PackageId>
+    <Version>5.2.1</Version>
+    <Authors>Umut Ozer</Authors>
+    <Description>High-performance, deterministic, NativeAOT-compatible hybrid mapping engine. Includes compile-time Source Generator (Layer 1) and runtime Expression Tree fallback (Layer 2).</Description>
+    <PackageTags>mapping;object-mapper;source-generator;nativeaot;expression-tree</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/umuto/VeloxMapper</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);CopyProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>VeloxMapper.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Runtime bağımlılığı: Core abstractions, attributes, exceptions. PrivateAssets="all" ile transitif paket bağımlılığını engelliyoruz. -->
+    <ProjectReference Include="..\VeloxMapper.Core\VeloxMapper.Core.csproj" PrivateAssets="all" />
+
+    <!--
+      Source Generator + Analyzer referansı.
+      - OutputItemType="Analyzer" → Derleme zamanı analyzer/generator olarak çalışır
+      - ReferenceOutputAssembly="false" → Runtime'da bağımlılık oluşturmaz (sadece compile-time)
+
+      ProjectReference olarak referans verildiğinde (NuGet olmadan) IDE ve build
+      Generator'ı canlı olarak çalıştırır.
+    -->
+    <ProjectReference Include="..\VeloxMapper.Generators\VeloxMapper.Generators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.5" />
+  </ItemGroup>
+
+  <!--
+    Generator DLL'ini NuGet paketinin analyzers/dotnet/cs/ klasörüne göm.
+
+    Yöntem: Microsoft'un önerdiği "None item" yaklaşımı.
+    - Önce Generator projesi build edilir (BuildGeneratorForPack target'ı)
+    - Ardından DLL'ler None item olarak pakete dahil edilir
+
+    Bu yöntem GetTargetPath yaklaşımından daha güvenilirdir çünkü:
+    - Cross-TFM sorunlarından (netstandard2.0 vs net10.0) etkilenmez
+    - MSBuild, item'ları pack zamanında doğru klasöre yerleştirir
+    - VeloxMapper.Core.dll de analyzer yanına eklenir (Generator'ın bağımlılığı)
+  -->
+
+  <!-- Pack öncesi Generator projesini derle -->
+  <Target Name="BuildGeneratorForPack" BeforeTargets="GenerateNuspec">
+    <MSBuild Projects="..\VeloxMapper.Generators\VeloxMapper.Generators.csproj"
+             Targets="Build"
+             Properties="Configuration=$(Configuration)" />
+  </Target>
+
+  <ItemGroup>
+    <!-- Generator DLL'ini analyzers/dotnet/cs/ klasörüne göm -->
+    <None Include="..\VeloxMapper.Generators\bin\$(Configuration)\netstandard2.0\VeloxMapper.Generators.dll"
+          Pack="true"
+          PackagePath="analyzers/dotnet/cs"
+          Visible="false" />
+
+    <!--
+      VeloxMapper.Core.dll de analyzer yanına eklenmeli.
+      Roslyn host, Generator'ı yüklediğinde VeloxMapAttribute sembolünü
+      bu DLL üzerinden çözümler. Eksik olursa "Could not load assembly" hatası oluşur.
+    -->
+    <None Include="..\VeloxMapper.Generators\bin\$(Configuration)\netstandard2.0\VeloxMapper.Core.dll"
+          Pack="true"
+          PackagePath="analyzers/dotnet/cs"
+          Visible="false" />
+  </ItemGroup>
+
+  <!-- Core DLL ve XML dokümanını paket çıktısına (lib/) gömüyoruz -->
+  <Target Name="CopyProjectReferencesToPackage" DependsOnTargets="ResolveReferences">
+    <ItemGroup>
+      <BuildOutputInPackage Include="@(ReferenceCopyLocalPaths)" Condition="'%(ReferenceCopyLocalPaths.Filename)' == 'VeloxMapper.Core' and ('%(ReferenceCopyLocalPaths.Extension)' == '.dll' or '%(ReferenceCopyLocalPaths.Extension)' == '.xml')" />
+    </ItemGroup>
+  </Target>
+
+</Project>

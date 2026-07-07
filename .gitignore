@@ -1,0 +1,31 @@
+## Visual Studio / MSBuild
+[Db]ebug/
+[Rr]elease/
+x64/
+x86/
+build/
+bin/
+obj/
+.vs/
+
+## NuGet
+*.nupkg
+*.snupkg
+nupkg/
+
+## User-specific files
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+## IDEs
+.idea/
+.rider/
+.vscode/
+
+## OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini

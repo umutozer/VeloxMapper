@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src\VeloxMapper\VeloxMapper.csproj" />
+    <Project Path="src\VeloxMapper.Core\VeloxMapper.Core.csproj" />
+    <Project Path="src\VeloxMapper.Generators\VeloxMapper.Generators.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests\VeloxMapper.Tests\VeloxMapper.Tests.csproj" />
+  </Folder>
+</Solution>

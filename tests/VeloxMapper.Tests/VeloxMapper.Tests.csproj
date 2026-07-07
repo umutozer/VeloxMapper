@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.10.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="10.0.0-preview.1.25081.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\VeloxMapper\VeloxMapper.csproj" />
+
+    <!--
+      Generator projesine iki referans veriyoruz:
+      1. OutputItemType="Analyzer" — Generator derleme sırasında bu test projesinde de çalışsın
+      2. Ayrı bir normal referans — test kodu MapperGenerator sınıfını doğrudan kullanabilsin
+         (in-memory Roslyn testi için gerekli)
+    -->
+    <ProjectReference Include="..\..\src\VeloxMapper.Generators\VeloxMapper.Generators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\..\src\VeloxMapper.Generators\VeloxMapper.Generators.csproj"
+                      ReferenceOutputAssembly="true" />
+  </ItemGroup>
+
+</Project>
