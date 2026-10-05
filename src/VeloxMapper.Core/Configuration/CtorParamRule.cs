@@ -4,22 +4,38 @@ using System.Linq.Expressions;
 namespace VeloxMapper.Configuration;
 
 /// <summary>
-/// ForCtorParam ile tanımlanan constructor parametre eşleştirme kuralı.
+/// <c>ForCtorParam</c> ile tanımlanan kurucu parametresi kuralı.
 /// </summary>
 public sealed class CtorParamRule
 {
-    /// <summary>Constructor parametre adı.</summary>
+    /// <summary>Kurucu parametresinin adı.</summary>
     public string ParameterName { get; }
 
-    /// <summary>Kaynak eşleştirme lambda ifadesi.</summary>
-    public LambdaExpression MapFromExpression { get; }
+    /// <summary>Kaynak ifadesi (<see cref="MapFromFunc"/> verilmişse <c>null</c>).</summary>
+    public LambdaExpression? MapFromExpression { get; }
+
+    /// <summary>Bağlamlı değer fonksiyonu: <c>(src, context) =&gt; ...</c>.</summary>
+    public Delegate? MapFromFunc { get; }
 
     /// <summary>
-    /// Yeni bir CtorParamRule örneği oluşturur.
+    /// Kaynak ifadesine dayalı bir kural oluşturur.
     /// </summary>
+    /// <param name="parameterName">Kurucu parametresinin adı.</param>
+    /// <param name="mapFromExpression">Kaynak ifadesi.</param>
     public CtorParamRule(string parameterName, LambdaExpression mapFromExpression)
     {
         ParameterName = parameterName ?? throw new ArgumentNullException(nameof(parameterName));
         MapFromExpression = mapFromExpression ?? throw new ArgumentNullException(nameof(mapFromExpression));
+    }
+
+    /// <summary>
+    /// Bağlamlı fonksiyona dayalı bir kural oluşturur.
+    /// </summary>
+    /// <param name="parameterName">Kurucu parametresinin adı.</param>
+    /// <param name="mapFromFunc">Değer üreten fonksiyon.</param>
+    public CtorParamRule(string parameterName, Delegate mapFromFunc)
+    {
+        ParameterName = parameterName ?? throw new ArgumentNullException(nameof(parameterName));
+        MapFromFunc = mapFromFunc ?? throw new ArgumentNullException(nameof(mapFromFunc));
     }
 }

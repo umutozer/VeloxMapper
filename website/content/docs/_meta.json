@@ -1,0 +1,40 @@
+{
+  "sections": [
+    {
+      "id": "getting-started",
+      "title": "Başlarken"
+    },
+    {
+      "id": "migration",
+      "title": "AutoMapper'dan Geçiş"
+    },
+    {
+      "id": "core-concepts",
+      "title": "Temel Kavramlar"
+    },
+    {
+      "id": "customization",
+      "title": "Eşleme Özelleştirme"
+    },
+    {
+      "id": "advanced",
+      "title": "İleri Seviye"
+    },
+    {
+      "id": "querying",
+      "title": "Sorgulama (ProjectTo)"
+    },
+    {
+      "id": "validation-performance",
+      "title": "Doğrulama & Performans"
+    },
+    {
+      "id": "api",
+      "title": "API Referansı"
+    },
+    {
+      "id": "resources",
+      "title": "Kaynaklar"
+    }
+  ]
+}

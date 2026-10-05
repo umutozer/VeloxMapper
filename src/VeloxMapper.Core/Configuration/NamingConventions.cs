@@ -57,4 +57,21 @@ namespace VeloxMapper
             return sb.ToString();
         }
     }
+
+    /// <summary>
+    /// Tam eşleşme (değişiklik yapmayan) isimlendirme kuralı.
+    /// AutoMapper'ın <c>ExactMatchNamingConvention</c> ile birebir uyumludur.
+    /// </summary>
+    public sealed class ExactMatchNamingConvention : ICustomNamingConvention
+    {
+        /// <summary>
+        /// Singleton instance.
+        /// </summary>
+        public static ExactMatchNamingConvention Instance { get; } = new();
+
+        /// <summary>
+        /// İsmi olduğu gibi döndürür.
+        /// </summary>
+        public string Normalize(string name) => name;
+    }
 }

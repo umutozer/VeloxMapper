@@ -49,14 +49,14 @@ public class VeloxMapperRefactorTests
         });
 
         // Act
-        var expression = ExpressionBuilder.BuildProjectToExpression(typeof(SourceEntity), typeof(DestDto), config);
+        var expression = ExpressionBuilder.BuildProjectionLambda(typeof(SourceEntity), typeof(DestDto), config, System.Array.Empty<string>());
 
         // Assert
         // SQL sağlayıcılarının çevirebilmesi için gövde BlockExpression veya ResolutionContext içermemelidir.
         Assert.NotNull(expression);
         Assert.True(expression.Body is MemberInitExpression || expression.Body is NewExpression);
-        Assert.False(expression.ToString().Contains("VeloxResolutionContext"));
-        Assert.False(expression.ToString().Contains("Block"));
+        Assert.DoesNotContain("VeloxResolutionContext", expression.ToString());
+        Assert.DoesNotContain("Block", expression.ToString());
     }
 
     #endregion
@@ -153,7 +153,7 @@ public class VeloxMapperRefactorTests
         var config = new MapperConfiguration(cfg =>
         {
             cfg.CreateMap<SourceEntity, DestDto>()
-               .ConvertUsing(new ScopedConverter("default"));
+               .ConvertUsing<ScopedConverter>(); // tür ile verilen dönüştürücü DI kapsayıcısından çözülür (AutoMapper davranışı)
         });
 
         var provider = new SimpleServiceProvider();
@@ -176,7 +176,7 @@ public class VeloxMapperRefactorTests
     #region 5. ReverseMap Kuralları
 
     [Fact]
-    public void ReverseMap_ShouldInheritIgnoreRules()
+    public void ReverseMap_DoesNotReverseIgnoreRules_LikeAutoMapper()
     {
         // Arrange
         var config = new MapperConfiguration(cfg =>
@@ -191,9 +191,9 @@ public class VeloxMapperRefactorTests
         var reversePlan = config.GetMappingPlan(typeof(DestDto), typeof(SourceEntity));
         var descriptionProp = reversePlan.Properties.FirstOrDefault(p => p.TargetProperty == "Description");
         
-        // Orijinal eşleşmedeki property adı "Description" ters yönde de ignore edilmiş olmalıdır.
+        // AutoMapper ile aynı: Ignore kuralları ters yöne taşınmaz; ters yönde Description konvansiyonla eşlenir.
         Assert.NotNull(descriptionProp);
-        Assert.Equal("Ignored", descriptionProp.ExecutionType);
+        Assert.Equal("Assigned", descriptionProp.ExecutionType);
     }
 
     #endregion

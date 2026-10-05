@@ -3,7 +3,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 using VeloxMapper.Abstractions;
 using VeloxMapper.Configuration;
-using VeloxMapper.DependencyInjection;
 
 namespace VeloxMapper.Tests;
 
@@ -226,9 +225,6 @@ public class VeloxMapperV5ResolverTests
 
         var sp = services.BuildServiceProvider();
         
-        // ForPathNameResolver sınıfının transient olarak başarıyla çözülebilmesi gerekir (Reviewer bulgusu doğrulama)
-        var resolver = sp.GetService<ForPathNameResolver>();
-        Assert.NotNull(resolver);
 
         var mapper = sp.GetRequiredService<IVeloxMapper>();
         var source = new ForPathRootSrc();

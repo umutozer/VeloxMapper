@@ -323,4 +323,28 @@ public class SourceGeneratorTests
         Assert.Contains("Id = source.Id", generatedSource);
         Assert.Contains("Ad = source.Ad", generatedSource);
     }
+
+    [Fact]
+    public void Generator_RecordVeGetOnlyHedef_DerlenebilirKodUretir()
+    {
+        const string source = """
+            using VeloxMapper.Attributes;
+            [assembly: VeloxMap(typeof(Kaynak), typeof(KayitHedef))]
+            [assembly: VeloxMap(typeof(Kaynak), typeof(SaltOkunurHedef))]
+            [assembly: VeloxMap(typeof(Kaynak), typeof(KurucusuzHedef))]
+
+            public class Kaynak { public int Id { get; set; } public string Ad { get; set; } = ""; public string Not { get; set; } = ""; }
+            public record KayitHedef(int Id, string Ad) { public string Not { get; init; } = ""; }
+            public class SaltOkunurHedef { public int Id { get; } public string Ad { get; set; } = ""; }
+            public class KurucusuzHedef { public KurucusuzHedef(System.Guid anahtar) { } }
+            """;
+
+        var (_, runResult) = RunGenerator(source); // üretilen kod hatasız derlenmeli (RunGenerator hata varsa fırlatır)
+
+        var generated = runResult.GeneratedTrees.Single().ToString();
+        Assert.Contains("new KayitHedef(source.Id, source.Ad)", generated);
+        Assert.Contains("Not = source.Not", generated);
+        Assert.DoesNotContain("Id = source.Id", generated.Substring(generated.IndexOf("MapToSaltOkunurHedef")));
+        Assert.Contains(runResult.Diagnostics, d => d.Id == "VM003" && d.GetMessage().Contains("KurucusuzHedef"));
+    }
 }

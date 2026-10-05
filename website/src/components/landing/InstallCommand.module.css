@@ -1,0 +1,59 @@
+.box {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  max-width: 420px;
+  height: 50px;
+  padding: 0 10px 0 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+  text-align: left;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.box:hover {
+  border-color: var(--accent-border);
+  box-shadow: var(--shadow-md);
+}
+
+.prompt {
+  font-family: var(--font-mono), monospace;
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.cmd {
+  padding: 0 !important;
+  background: none !important;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14.5px;
+  color: var(--fg-strong);
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+  background: var(--bg-subtle);
+}
+
+.box:hover .icon {
+  color: var(--fg-strong);
+}
+
+.icon[data-copied] {
+  color: var(--success);
+  background: var(--success-soft);
+}

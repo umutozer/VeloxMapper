@@ -5,214 +5,297 @@ using VeloxMapper.Abstractions;
 namespace VeloxMapper;
 
 /// <summary>
-/// Non-generic IMappingExpression arayüzü. Open generic kayıtlar için fluent zincir desteği sunar.
+/// Tür bilgisi derleme zamanında bilinmeyen eşleştirmeler (<c>CreateMap(typeof(A&lt;&gt;), typeof(B&lt;&gt;))</c>) ve
+/// <c>ForAllMaps</c> için fluent yapılandırma arayüzü. AutoMapper'ın non-generic <c>IMappingExpression</c> arayüzü ile uyumludur.
 /// </summary>
 public interface IMappingExpression
 {
+    /// <summary>Ters yönde (hedef → kaynak) bir eşleştirme oluşturur.</summary>
+    IMappingExpression ReverseMap();
+
+    /// <summary>Adı verilen hedef üyeyi yapılandırır.</summary>
+    IMappingExpression ForMember(string name, Action<IMemberConfigurationExpression> memberOptions);
+
+    /// <summary>Tüm hedef üyelere aynı yapılandırmayı uygular.</summary>
+    IMappingExpression ForAllMembers(Action<IMemberConfigurationExpression> memberOptions);
+
+    /// <summary>Açıkça yapılandırılmamış hedef üyelere aynı yapılandırmayı uygular.</summary>
+    IMappingExpression ForAllOtherMembers(Action<IMemberConfigurationExpression> memberOptions);
+
+    /// <summary>Adı verilen kaynak üyeyi yapılandırır.</summary>
+    IMappingExpression ForSourceMember(string sourceMemberName, Action<ISourceMemberConfigurationExpression> memberOptions);
+
+    /// <summary>Eşleştirmeyi tamamen verilen tip dönüştürücüye devreder (open generic dönüştürücüler desteklenir).</summary>
+    IMappingExpression ConvertUsing(Type typeConverterType);
+
+    /// <summary>Türetilmiş tür çiftini polimorfik eşleştirmeye dahil eder.</summary>
+    IMappingExpression Include(Type derivedSourceType, Type derivedDestinationType);
+
+    /// <summary>Taban tür çiftinin yapılandırmasını devralır.</summary>
+    IMappingExpression IncludeBase(Type sourceBase, Type destinationBase);
+
+    /// <summary>Bu eşleştirmeden türeyen tüm eşleştirmeleri polimorfik eşleştirmeye dahil eder.</summary>
+    IMappingExpression IncludeAllDerived();
+
+    /// <summary>Sonucu başka bir hedef türe yönlendirir.</summary>
+    IMappingExpression As(Type typeOverride);
+
+    /// <summary>Rekürsif eşleştirme derinliğini sınırlar.</summary>
+    IMappingExpression MaxDepth(int depth);
+
+    /// <summary>Döngüsel referanslarda aynı kaynak için aynı hedef örneğini kullanır.</summary>
+    IMappingExpression PreserveReferences();
+
+    /// <summary>Doğrulanacak üye listesini belirler.</summary>
+    IMappingExpression ValidateMemberList(MemberList memberList);
+
+    /// <summary>Kurucu doğrulamasını devre dışı bırakır.</summary>
+    IMappingExpression DisableCtorValidation();
+
+    /// <summary>Setter'ı erişilemez olan hedef property'leri yok sayar.</summary>
+    IMappingExpression IgnoreAllPropertiesWithAnInaccessibleSetter();
+
+    /// <summary>Getter'ı erişilemez olan kaynak property'leri kaynak doğrulamasından muaf tutar.</summary>
+    IMappingExpression IgnoreAllSourcePropertiesWithAnInaccessibleSetter();
 }
 
 /// <summary>
-/// <c>CreateMap&lt;TSource, TDest&gt;()</c> çağrısından dönen fluent API arayüzü.
-/// ForMember, Ignore, ConvertUsing, ReverseMap, ConstructUsing ve ForAllMembers
-/// yapılandırma metotlarını sunar.
-/// AutoMapper'ın <c>IMappingExpression&lt;TSource, TDestination&gt;</c> ile API uyumludur.
+/// <c>CreateMap&lt;TSource, TDestination&gt;()</c> çağrısından dönen fluent yapılandırma arayüzü.
+/// AutoMapper'ın <c>IMappingExpression&lt;TSource, TDestination&gt;</c> arayüzü ile aynı metot adlarına ve overload'lara sahiptir.
 /// </summary>
-/// <typeparam name="TSource">Kaynak tür</typeparam>
-/// <typeparam name="TDestination">Hedef tür</typeparam>
-public interface IMappingExpression<TSource, TDestination> : IMappingExpression
+/// <typeparam name="TSource">Kaynak tür.</typeparam>
+/// <typeparam name="TDestination">Hedef tür.</typeparam>
+public interface IMappingExpression<TSource, TDestination>
 {
+    // ─── Üye yapılandırması ─────────────────────────────────────────────────
+
     /// <summary>
-    /// Belirli bir hedef property için özel eşleştirme kuralı tanımlar.
-    /// AutoMapper uyumlu ForMember pattern'i kullanır.
+    /// Bir hedef üyeyi (property veya field) yapılandırır: <c>.ForMember(d =&gt; d.FullName, o =&gt; o.MapFrom(s =&gt; s.First + " " + s.Last))</c>.
+    /// İç içe hedef yolları için <see cref="ForPath{TMember}"/> kullanın.
     /// </summary>
-    /// <typeparam name="TMember">Hedef property'nin tipi</typeparam>
-    /// <param name="destinationMember">Hedef property seçici (dest =&gt; dest.PropertyName)</param>
-    /// <param name="memberOptions">Üye yapılandırma eylemi (opt =&gt; opt.MapFrom(...) veya opt.Ignore())</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
+    /// <typeparam name="TMember">Hedef üyenin türü.</typeparam>
+    /// <param name="destinationMember">Hedef üye seçicisi.</param>
+    /// <param name="memberOptions">Üye yapılandırması.</param>
     IMappingExpression<TSource, TDestination> ForMember<TMember>(
         Expression<Func<TDestination, TMember>> destinationMember,
         Action<IMemberConfigurationExpression<TSource, TDestination, TMember>> memberOptions);
 
     /// <summary>
-    /// Tüm otomatik eşleştirmeyi devre dışı bırakarak bu çift için özel dönüştürücü kullanır.
+    /// Adı verilen hedef üyeyi yapılandırır.
     /// </summary>
-    /// <param name="converter">Özel tip dönüştürücü implementasyonu</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> ConvertUsing(
-        IVeloxTypeConverter<TSource, TDestination> converter);
-
-    /// <summary>
-    /// Tüm otomatik eşleştirmeyi devre dışı bırakarak bu çift için verilen lambda/fonksiyon dönüştürücüsünü kullanır.
-    /// </summary>
-    /// <param name="mappingFunction">Özel dönüşüm fonksiyonu</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> ConvertUsing(
-        Func<TSource?, TDestination> mappingFunction);
-
-    /// <summary>
-    /// Belirli bir hedef property'yi eşleştirme dışında bırakır.
-    /// <c>ForMember(dest =&gt; dest.X, opt =&gt; opt.Ignore())</c> için kısayol.
-    /// </summary>
-    /// <param name="destinationMember">Yok sayılacak hedef property seçici</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> Ignore(
-        Expression<Func<TDestination, object?>> destinationMember);
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // AutoMapper Geçiş Uyumluluk API'si
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Ters yönde (<typeparamref name="TDestination"/> → <typeparamref name="TSource"/>)
-    /// otomatik isim eşleşmeli haritalama kaydı oluşturur.
-    /// AutoMapper'ın <c>.ReverseMap()</c> ile birebir uyumludur.
-    /// <para>
-    /// Ters yöne özel ForMember kuralları tanımlamak için
-    /// ayrıca <c>CreateMap&lt;TDestination, TSource&gt;()</c> kullanın.
-    /// </para>
-    /// </summary>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> ReverseMap();
-
-    /// <summary>
-    /// Hedef nesneyi varsayılan constructor yerine verilen factory delegate ile oluşturur.
-    /// AutoMapper'ın <c>.ConstructUsing()</c> ile birebir uyumludur.
-    /// <para>
-    /// Parametreli constructor, private setter veya DI bağımlılığı gerektiren
-    /// Entity sınıfları için kullanışlıdır.
-    /// Property atamaları factory sonrasında da uygulanmaya devam eder.
-    /// </para>
-    /// </summary>
-    /// <param name="factory">Kaynak nesneden hedef nesne üreten factory</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> ConstructUsing(
-        Func<TSource, TDestination> factory);
-
-    /// <summary>
-    /// Tüm property atamaları için toplu kural uygular.
-    /// AutoMapper'ın <c>.ForAllMembers()</c> ile birebir uyumludur.
-    /// <para>
-    /// En yaygın kullanım — null-ignore (PATCH pattern'ı):
-    /// <code>
-    /// CreateMap&lt;UpdateDto, Entity&gt;()
-    ///     .ForAllMembers(opt => opt.Condition((src, dest, v) => v != null));
-    /// </code>
-    /// </para>
-    /// </summary>
-    /// <param name="memberOptions">Toplu kural yapılandırma eylemi</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> ForAllMembers(
-        Action<IForAllMembersExpression<TSource, TDestination>> memberOptions);
-
-    /// <summary>
-    /// Açıkça konfigüre edilmemiş tüm property atamaları için toplu kural uygular.
-    /// AutoMapper'ın <c>.ForAllOtherMembers()</c> ile birebir uyumludur.
-    /// </summary>
-    IMappingExpression<TSource, TDestination> ForAllOtherMembers(
+    /// <param name="name">Hedef üye adı.</param>
+    /// <param name="memberOptions">Üye yapılandırması.</param>
+    IMappingExpression<TSource, TDestination> ForMember(
+        string name,
         Action<IMemberConfigurationExpression<TSource, TDestination, object>> memberOptions);
 
     /// <summary>
-    /// Eşleştirme işlemi başlamadan önce çalıştırılacak DI-destekli bir eylem tanımlar.
+    /// İç içe bir hedef yolunu yapılandırır: <c>.ForPath(d =&gt; d.Customer.Name, o =&gt; o.MapFrom(s =&gt; s.CustomerName))</c>.
+    /// Yoldaki ara nesneler <c>null</c> ise oluşturulur.
     /// </summary>
-    /// <typeparam name="TAction">IVeloxMappingAction türü</typeparam>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> BeforeMap<TAction>()
-        where TAction : IVeloxMappingAction<TSource, TDestination>;
-
-    /// <summary>
-    /// Eşleştirme işlemi başlamadan önce çalıştırılacak inline (satır içi) bir eylem tanımlar.
-    /// </summary>
-    /// <param name="action">Eylem delegesi</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> BeforeMap(Action<TSource, TDestination> action);
-
-    /// <summary>
-    /// Eşleştirme işlemi tamamlandıktan sonra çalıştırılacak DI-destekli bir eylem tanımlar.
-    /// </summary>
-    /// <typeparam name="TAction">IVeloxMappingAction türü</typeparam>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> AfterMap<TAction>()
-        where TAction : IVeloxMappingAction<TSource, TDestination>;
-
-    /// <summary>
-    /// Eşleştirme işlemi tamamlandıktan sonra çalıştırılacak inline (satır içi) bir eylem tanımlar.
-    /// </summary>
-    /// <param name="action">Eylem delegesi</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> AfterMap(Action<TSource, TDestination> action);
-
-    /// <summary>
-    /// Rekürsif mapping derinliğini sınırlar. Self-referencing türlerde StackOverflow'u önler.
-    /// </summary>
-    IMappingExpression<TSource, TDestination> MaxDepth(int depth);
-
-    /// <summary>
-    /// Döngüsel referanslarda aynı kaynak nesnesini tekrar map etmek yerine önceki sonucu döndürür.
-    /// </summary>
-    IMappingExpression<TSource, TDestination> PreserveReferences();
-
-    /// <summary>
-    /// Derived tür çifti için polimorfik haritalama kaydı tanımlar. Runtime'da kaynak nesne
-    /// TDerivedSource türündeyse otomatik olarak TDerivedDestination'a map edilir.
-    /// </summary>
-    /// <typeparam name="TDerivedSource">Alt kaynak tür</typeparam>
-    /// <typeparam name="TDerivedDestination">Alt hedef tür</typeparam>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> Include<TDerivedSource, TDerivedDestination>()
-        where TDerivedSource : TSource
-        where TDerivedDestination : TDestination;
-
-    /// <summary>
-    /// Base tür çiftinin kurallarını bu haritalamaya miras alır.
-    /// </summary>
-    /// <typeparam name="TBaseSource">Üst kaynak tür</typeparam>
-    /// <typeparam name="TBaseDestination">Üst hedef tür</typeparam>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> IncludeBase<TBaseSource, TBaseDestination>();
-
-    /// <summary>
-    /// Bu eşleştirmenin tüm alt (derived) sınıf eşleştirmelerini otomatik olarak
-    /// polimorfik haritalamaya (Include) dahil eder.
-    /// AutoMapper'ın <c>.IncludeAllDerived()</c> ile birebir uyumludur.
-    /// </summary>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> IncludeAllDerived();
-
-    /// <summary>
-    /// Bu eşleştirmenin sonucunu başka bir hedef tipe yönlendirir.
-    /// AutoMapper'ın <c>.As&lt;TDestinationRedirect&gt;()</c> ile birebir uyumludur.
-    /// </summary>
-    /// <typeparam name="TDestinationRedirect">Yönlendirilecek hedef tür</typeparam>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
-    IMappingExpression<TSource, TDestination> As<TDestinationRedirect>()
-        where TDestinationRedirect : TDestination;
-
-    /// <summary>
-    /// Derin yol üzerinden property eşleştirme kuralı tanımlar. Nested nesnelere mapping için kullanılır.
-    /// Örnek: ForPath(d => d.Customer.Name, opt => opt.MapFrom(s => s.CustomerName))
-    /// </summary>
-    /// <typeparam name="TMember">Hedef property'nin tipi</typeparam>
-    /// <param name="destinationPath">Hedef property yol seçici (dest => dest.Nested.Property)</param>
-    /// <param name="memberOptions">Üye yapılandırma eylemi (opt => opt.MapFrom(...) veya opt.Ignore())</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
+    /// <typeparam name="TMember">Yolun son üyesinin türü.</typeparam>
+    /// <param name="destinationMember">Hedef yol seçicisi.</param>
+    /// <param name="memberOptions">Üye yapılandırması.</param>
     IMappingExpression<TSource, TDestination> ForPath<TMember>(
-        Expression<Func<TDestination, TMember>> destinationPath,
+        Expression<Func<TDestination, TMember>> destinationMember,
         Action<IMemberConfigurationExpression<TSource, TDestination, TMember>> memberOptions);
 
     /// <summary>
-    /// Constructor parametresine özel kaynak eşleştirmesi tanımlar. Record ve immutable sınıflar için kullanılır.
+    /// Bir kaynak üyeyi yapılandırır (<c>MemberList.Source</c> doğrulaması için).
     /// </summary>
-    /// <param name="ctorParamName">Constructor parametresinin adı</param>
-    /// <param name="paramOptions">Parametre yapılandırma eylemi</param>
-    /// <returns>Fluent zincirleme için aynı ifade örneği</returns>
+    /// <param name="sourceMember">Kaynak üye seçicisi.</param>
+    /// <param name="memberOptions">Kaynak üye yapılandırması.</param>
+    IMappingExpression<TSource, TDestination> ForSourceMember(
+        Expression<Func<TSource, object?>> sourceMember,
+        Action<ISourceMemberConfigurationExpression> memberOptions);
+
+    /// <summary>
+    /// Adı verilen kaynak üyeyi yapılandırır.
+    /// </summary>
+    /// <param name="sourceMemberName">Kaynak üye adı.</param>
+    /// <param name="memberOptions">Kaynak üye yapılandırması.</param>
+    IMappingExpression<TSource, TDestination> ForSourceMember(
+        string sourceMemberName,
+        Action<ISourceMemberConfigurationExpression> memberOptions);
+
+    /// <summary>
+    /// Bir kurucu parametresinin değer kaynağını belirler (record ve immutable türler için).
+    /// </summary>
+    /// <param name="ctorParamName">Parametre adı.</param>
+    /// <param name="paramOptions">Parametre yapılandırması.</param>
     IMappingExpression<TSource, TDestination> ForCtorParam(
         string ctorParamName,
         Action<ICtorParamConfigurationExpression<TSource>> paramOptions);
 
     /// <summary>
-    /// Enum'lar arası eşleştirmeyi özelleştirmek için kullanılır.
-    /// AutoMapper'ın <c>.ConvertUsingEnumMapping()</c> ile birebir uyumludur.
+    /// Tüm hedef üyelere aynı yapılandırmayı uygular. Örnek (PATCH):
+    /// <c>.ForAllMembers(o =&gt; o.Condition((src, dest, srcMember) =&gt; srcMember != null))</c>.
     /// </summary>
-    IMappingExpression<TSource, TDestination> ConvertUsingEnumMapping(
-        Action<EnumMappingExpression<TSource, TDestination>> configure);
+    /// <param name="memberOptions">Üye yapılandırması.</param>
+    IMappingExpression<TSource, TDestination> ForAllMembers(
+        Action<IMemberConfigurationExpression<TSource, TDestination, object>> memberOptions);
+
+    /// <summary>
+    /// <c>ForMember</c>/<c>ForPath</c> ile açıkça yapılandırılmamış hedef üyelere aynı yapılandırmayı uygular.
+    /// </summary>
+    /// <param name="memberOptions">Üye yapılandırması.</param>
+    IMappingExpression<TSource, TDestination> ForAllOtherMembers(
+        Action<IMemberConfigurationExpression<TSource, TDestination, object>> memberOptions);
+
+    /// <summary>
+    /// Bir hedef üyeyi yok sayar. <c>ForMember(d =&gt; d.X, o =&gt; o.Ignore())</c> kısayoludur.
+    /// </summary>
+    /// <param name="destinationMember">Hedef üye seçicisi.</param>
+    IMappingExpression<TSource, TDestination> Ignore(Expression<Func<TDestination, object?>> destinationMember);
+
+    /// <summary>
+    /// Bu eşleştirmeye özel bir value transformer ekler (ör. tüm string'leri kırpmak için).
+    /// </summary>
+    /// <typeparam name="TValue">Dönüştürülecek değer türü.</typeparam>
+    /// <param name="transformer">Dönüşüm ifadesi.</param>
+    IMappingExpression<TSource, TDestination> AddTransform<TValue>(Expression<Func<TValue, TValue>> transformer);
+
+    // ─── Tür dönüştürme ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Eşleştirmeyi tamamen bir ifadeye devreder. İfade <c>ProjectTo</c> içinde de kullanılır.
+    /// </summary>
+    /// <param name="mappingExpression">Dönüşüm ifadesi.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsing(Expression<Func<TSource, TDestination>> mappingExpression);
+
+    /// <summary>
+    /// Eşleştirmeyi tamamen bir fonksiyona devreder: <c>(src, existingDest) =&gt; ...</c>.
+    /// </summary>
+    /// <param name="mappingFunction">Dönüşüm fonksiyonu.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsing(Func<TSource, TDestination, TDestination> mappingFunction);
+
+    /// <summary>
+    /// Eşleştirmeyi tamamen bir fonksiyona devreder: <c>(src, existingDest, context) =&gt; ...</c>.
+    /// </summary>
+    /// <param name="mappingFunction">Dönüşüm fonksiyonu.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsing(Func<TSource, TDestination, ResolutionContext, TDestination> mappingFunction);
+
+    /// <summary>
+    /// Eşleştirmeyi tamamen bir tip dönüştürücü örneğine devreder.
+    /// </summary>
+    /// <param name="converter">Dönüştürücü.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsing(ITypeConverter<TSource, TDestination> converter);
+
+    /// <summary>
+    /// Eşleştirmeyi VeloxMapper 5.x tarzı bir tip dönüştürücü örneğine devreder.
+    /// </summary>
+    /// <param name="converter">Dönüştürücü.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsing(IVeloxTypeConverter<TSource, TDestination> converter);
+
+    /// <summary>
+    /// Eşleştirmeyi DI konteynerinden çözülen bir tip dönüştürücüye devreder.
+    /// </summary>
+    /// <typeparam name="TTypeConverter"><see cref="ITypeConverter{TSource,TDestination}"/> uygulayan tür.</typeparam>
+    IMappingExpression<TSource, TDestination> ConvertUsing<TTypeConverter>();
+
+    /// <summary>
+    /// Eşleştirmeyi türü çalışma zamanında verilen bir tip dönüştürücüye devreder.
+    /// </summary>
+    /// <param name="typeConverterType">Dönüştürücü türü.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsing(Type typeConverterType);
+
+    /// <summary>
+    /// Enum'dan enum'a eşleştirmeyi özelleştirir: <c>.ConvertUsingEnumMapping(o =&gt; o.MapByName().MapValue(A.X, B.Y))</c>.
+    /// </summary>
+    /// <param name="configure">Enum eşleştirme yapılandırması.</param>
+    IMappingExpression<TSource, TDestination> ConvertUsingEnumMapping(Action<EnumMappingExpression<TSource, TDestination>> configure);
+
+    // ─── Nesne oluşturma ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Hedef nesneyi verilen fabrika ile oluşturur; üye atamaları ardından uygulanır.
+    /// </summary>
+    /// <param name="ctor">Fabrika.</param>
+    IMappingExpression<TSource, TDestination> ConstructUsing(Func<TSource, TDestination> ctor);
+
+    /// <summary>
+    /// Hedef nesneyi kaynak ve bağlamı kullanan fabrika ile oluşturur.
+    /// </summary>
+    /// <param name="ctor">Fabrika.</param>
+    IMappingExpression<TSource, TDestination> ConstructUsing(Func<TSource, ResolutionContext, TDestination> ctor);
+
+    /// <summary>
+    /// Hedef nesneyi DI konteynerinden çözer.
+    /// </summary>
+    IMappingExpression<TSource, TDestination> ConstructUsingServiceLocator();
+
+    // ─── Before / After ─────────────────────────────────────────────────────
+
+    /// <summary>Eşleştirme başlamadan önce çalışacak eylem.</summary>
+    IMappingExpression<TSource, TDestination> BeforeMap(Action<TSource, TDestination> beforeFunction);
+
+    /// <summary>Eşleştirme başlamadan önce çalışacak, bağlam alan eylem.</summary>
+    IMappingExpression<TSource, TDestination> BeforeMap(Action<TSource, TDestination, ResolutionContext> beforeFunction);
+
+    /// <summary>Eşleştirme başlamadan önce çalışacak, DI ile çözülen eylem (<see cref="IMappingAction{TSource,TDestination}"/>).</summary>
+    IMappingExpression<TSource, TDestination> BeforeMap<TMappingAction>();
+
+    /// <summary>Eşleştirme tamamlandıktan sonra çalışacak eylem.</summary>
+    IMappingExpression<TSource, TDestination> AfterMap(Action<TSource, TDestination> afterFunction);
+
+    /// <summary>Eşleştirme tamamlandıktan sonra çalışacak, bağlam alan eylem.</summary>
+    IMappingExpression<TSource, TDestination> AfterMap(Action<TSource, TDestination, ResolutionContext> afterFunction);
+
+    /// <summary>Eşleştirme tamamlandıktan sonra çalışacak, DI ile çözülen eylem (<see cref="IMappingAction{TSource,TDestination}"/>).</summary>
+    IMappingExpression<TSource, TDestination> AfterMap<TMappingAction>();
+
+    // ─── Kalıtım ────────────────────────────────────────────────────────────
+
+    /// <summary>Türetilmiş tür çiftini polimorfik eşleştirmeye dahil eder.</summary>
+    IMappingExpression<TSource, TDestination> Include<TOtherSource, TOtherDestination>()
+        where TOtherSource : TSource
+        where TOtherDestination : TDestination;
+
+    /// <summary>Türetilmiş tür çiftini polimorfik eşleştirmeye dahil eder.</summary>
+    IMappingExpression<TSource, TDestination> Include(Type derivedSourceType, Type derivedDestinationType);
+
+    /// <summary>Taban tür çiftinin yapılandırmasını devralır.</summary>
+    IMappingExpression<TSource, TDestination> IncludeBase<TSourceBase, TDestinationBase>();
+
+    /// <summary>Taban tür çiftinin yapılandırmasını devralır.</summary>
+    IMappingExpression<TSource, TDestination> IncludeBase(Type sourceBase, Type destinationBase);
+
+    /// <summary>Bu eşleştirmeden türeyen tüm eşleştirmeleri polimorfik eşleştirmeye dahil eder.</summary>
+    IMappingExpression<TSource, TDestination> IncludeAllDerived();
+
+    /// <summary>
+    /// Kaynağın alt nesnelerindeki üyeleri hedefe düzleştirir: <c>.IncludeMembers(s =&gt; s.Details)</c>.
+    /// </summary>
+    /// <param name="memberExpressions">Alt nesne seçicileri.</param>
+    IMappingExpression<TSource, TDestination> IncludeMembers(params Expression<Func<TSource, object?>>[] memberExpressions);
+
+    /// <summary>Sonucu türetilmiş bir hedef türe yönlendirir.</summary>
+    IMappingExpression<TSource, TDestination> As<TOtherDestination>() where TOtherDestination : TDestination;
+
+    // ─── Diğer ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Ters yönde (<typeparamref name="TDestination"/> → <typeparamref name="TSource"/>) eşleştirme oluşturur ve onu döndürür.
+    /// Basit <c>MapFrom</c> kuralları ve flattening otomatik olarak tersine çevrilir; ters yöne özel kurallar zincire eklenebilir:
+    /// <c>.ReverseMap().ForMember(s =&gt; s.X, o =&gt; o.Ignore())</c>.
+    /// </summary>
+    IMappingExpression<TDestination, TSource> ReverseMap();
+
+    /// <summary>Rekürsif eşleştirme derinliğini sınırlar.</summary>
+    IMappingExpression<TSource, TDestination> MaxDepth(int depth);
+
+    /// <summary>Döngüsel referanslarda aynı kaynak için aynı hedef örneğini kullanır.</summary>
+    IMappingExpression<TSource, TDestination> PreserveReferences();
+
+    /// <summary>Doğrulanacak üye listesini belirler (<see cref="MemberList"/>).</summary>
+    IMappingExpression<TSource, TDestination> ValidateMemberList(MemberList memberList);
+
+    /// <summary>Kurucu parametresi doğrulamasını devre dışı bırakır.</summary>
+    IMappingExpression<TSource, TDestination> DisableCtorValidation();
+
+    /// <summary>Setter'ı erişilemez (private/protected) olan hedef property'leri yok sayar.</summary>
+    IMappingExpression<TSource, TDestination> IgnoreAllPropertiesWithAnInaccessibleSetter();
+
+    /// <summary>Getter'ı erişilemez olan kaynak property'leri kaynak doğrulamasından muaf tutar.</summary>
+    IMappingExpression<TSource, TDestination> IgnoreAllSourcePropertiesWithAnInaccessibleSetter();
 }

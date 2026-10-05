@@ -5,7 +5,6 @@ using Xunit;
 using Microsoft.Extensions.DependencyInjection;
 using VeloxMapper.Configuration;
 using VeloxMapper.Exceptions;
-using VeloxMapper.DependencyInjection;
 
 namespace VeloxMapper.Tests;
 

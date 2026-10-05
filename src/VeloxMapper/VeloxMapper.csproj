@@ -9,13 +9,16 @@
 
     <!-- NuGet paket meta bilgileri -->
     <PackageId>VeloxMapper</PackageId>
-    <Version>5.2.1</Version>
+    <Version>6.0.0</Version>
     <Authors>Umut Ozer</Authors>
-    <Description>High-performance, deterministic, NativeAOT-compatible hybrid mapping engine. Includes compile-time Source Generator (Layer 1) and runtime Expression Tree fallback (Layer 2).</Description>
-    <PackageTags>mapping;object-mapper;source-generator;nativeaot;expression-tree</PackageTags>
+    <Description>MIT licensed, AutoMapper-compatible object mapper for .NET 8/9/10. Same API names (Profile, CreateMap, ForMember, MapFrom, IMapper, MapperConfiguration, ProjectTo, AssertConfigurationIsValid) so existing AutoMapper code migrates by changing the package and using statements. Hybrid engine: compile-time Source Generator plus cached Expression Tree compilation, EF Core ProjectTo, fail-fast validation and mapping plan diagnostics.</Description>
+    <PackageProjectUrl>https://veloxmapper-website.netlify.app</PackageProjectUrl>
+    <PackageReleaseNotes>6.0.0: AutoMapper API parity (IMapper, Profile, ResolutionContext, IValueResolver, ITypeConverter, IValueConverter, IMappingAction, AddAutoMapper alias, VeloxMapper.QueryableExtensions), ReverseMap chaining, MapFrom with any source type, Map(source, destination) returns destination and maps nested objects in place, transient IMapper with scoped DI, per-profile conventions, EF Core ProjectTo fixes. See https://veloxmapper-website.netlify.app/docs/changelog</PackageReleaseNotes>
+    <Copyright>© 2026 Umut Özer</Copyright>
+    <PackageTags>automapper;automapper-alternative;mapper;object-mapper;mapping;dto;profile;projectto;efcore;source-generator;nativeaot;expression-tree</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <RepositoryUrl>https://github.com/umuto/VeloxMapper</RepositoryUrl>
+    <RepositoryUrl>https://github.com/umutozer/VeloxMapper</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <TargetsForTfmSpecificBuildOutput>$(TargetsForTfmSpecificBuildOutput);CopyProjectReferencesToPackage</TargetsForTfmSpecificBuildOutput>
   </PropertyGroup>
@@ -47,8 +50,18 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.5" />
+  <!-- Bağımlılıklar hedef framework ile aynı ana sürümden (alt sınır) seçilir; net8 uygulamaları 10.x paketlerine zorlanmaz. -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.0" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
   </ItemGroup>
 
   <!--

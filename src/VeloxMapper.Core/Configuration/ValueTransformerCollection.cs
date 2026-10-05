@@ -5,65 +5,36 @@ using System.Linq.Expressions;
 namespace VeloxMapper.Configuration;
 
 /// <summary>
-/// Belirli bir tipe ait tüm değerlere otomatik dönüşüm uygulayan transformer (dönüştürücü) koleksiyonu.
+/// Belirli bir türdeki tüm hedef değerlere otomatik uygulanan dönüşümlerin (value transformer) listesi.
+/// AutoMapper'ın <c>ValueTransformers.Add&lt;string&gt;(val =&gt; val.Trim())</c> kullanımı ile uyumludur.
 /// </summary>
 public sealed class ValueTransformerCollection
 {
-    private readonly Dictionary<Type, List<Delegate>> _transformers = new();
+    private readonly List<KeyValuePair<Type, LambdaExpression>> _transformers = new();
 
     /// <summary>
-    /// Belirli bir tip için transformer (dönüştürücü) fonksiyonu ekler.
+    /// Verilen türdeki (ve bu türe atanabilir) hedef üyelere uygulanacak bir dönüşüm ekler.
+    /// Dönüşümler eklenme sırasıyla zincirlenir.
     /// </summary>
-    /// <typeparam name="TValue">Dönüştürülecek değerin tipi</typeparam>
-    /// <param name="transformer">Dönüştürücü fonksiyon</param>
-    public void Add<TValue>(Func<TValue, TValue> transformer)
+    /// <typeparam name="TValue">Dönüştürülecek değerin türü.</typeparam>
+    /// <param name="transformer">Dönüşüm ifadesi, ör. <c>val =&gt; val.Trim()</c>.</param>
+    public void Add<TValue>(Expression<Func<TValue, TValue>> transformer)
     {
         if (transformer == null) throw new ArgumentNullException(nameof(transformer));
-
-        var type = typeof(TValue);
-        if (!_transformers.TryGetValue(type, out var list))
-        {
-            list = new List<Delegate>();
-            _transformers[type] = list;
-        }
-        list.Add(transformer);
+        _transformers.Add(new(typeof(TValue), transformer));
     }
 
-    /// <summary>
-    /// Verilen tip için kayıtlı olan tüm transformer delegelerini sırayla çalıştıran tek bir delege döndürür.
-    /// Kayıt yoksa null döner.
-    /// </summary>
-    internal Delegate? GetTransformer(Type type)
-    {
-        if (!_transformers.TryGetValue(type, out var list) || list.Count == 0)
-        {
-            return null;
-        }
-
-        if (list.Count == 1)
-        {
-            return list[0];
-        }
-
-        return BuildChainedTransformer(type, list);
-    }
+    /// <summary>Kayıtlı dönüşüm sayısı.</summary>
+    public int Count => _transformers.Count;
 
     /// <summary>
-    /// Kayıtlı tüm transformer'ları zincirleyerek tek bir delege haline getirir.
+    /// Verilen hedef türe uygulanabilir dönüşümleri eklenme sırasıyla döndürür.
     /// </summary>
-    private static Delegate BuildChainedTransformer(Type type, List<Delegate> list)
+    internal IEnumerable<LambdaExpression> GetTransformers(Type destinationType)
     {
-        var param = Expression.Parameter(type, "val");
-        Expression current = param;
-
-        foreach (var transformer in list)
+        foreach (var kvp in _transformers)
         {
-            var transformerConst = Expression.Constant(transformer);
-            current = Expression.Invoke(transformerConst, current);
+            if (kvp.Key.IsAssignableFrom(destinationType)) yield return kvp.Value;
         }
-
-        var funcType = typeof(Func<,>).MakeGenericType(type, type);
-        var lambda = Expression.Lambda(funcType, current, param);
-        return lambda.Compile();
     }
 }

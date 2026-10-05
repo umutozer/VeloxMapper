@@ -1,1157 +1,837 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Linq.Expressions;
 using System.Reflection;
+using System.Text;
+using Microsoft.Extensions.Logging;
 using VeloxMapper.Abstractions;
-using VeloxMapper.Exceptions;
-using VeloxMapper.Diagnostics;
 using VeloxMapper.Caching;
+using VeloxMapper.Configuration;
+using VeloxMapper.Diagnostics;
+using VeloxMapper.Exceptions;
+using VeloxMapper.Execution;
 
-namespace VeloxMapper.Configuration;
-
-/// <summary>
-/// Patch (yama) moduna özel yapılandırma seçenekleri.
-/// </summary>
-public sealed class PatchMappingOptions
-{
-    /// <summary>
-    /// Eğer true ise, yama modunda (Patch) kaynak (source) null olan değerler hedefe kopyalanmaz.
-    /// Varsayılan: false — null bir valid değerdir ve üzerine yazar.
-    /// </summary>
-    public bool IgnoreNullValues { get; set; }
-}
+namespace VeloxMapper;
 
 /// <summary>
-/// Mapper'ın çalışma zamanı yapılandırmasını toplamak için kullanılan builder sınıfı.
-/// MapperConfiguration oluşturulurken <c>Action&lt;VeloxMapperOptions&gt;</c> ile ayarlanır.
-/// <para>
-/// Desteklenen yapılandırma yöntemleri:
-/// <list type="bullet">
-///   <item>Profil ekleme: <c>AddProfile&lt;T&gt;()</c></item>
-///   <item>Assembly tarama: <c>AddProfilesFromAssembly()</c></item>
-///   <item>Inline eşleştirme: <c>CreateMap&lt;TSource, TDest&gt;()</c></item>
-///   <item>Özel dönüştürücü: <c>AddCustomConverter&lt;TSource, TDest&gt;()</c></item>
-/// </list>
-/// </para>
+/// Dondurulmuş (değişmez) eşleştirme yapılandırması. AutoMapper'ın <c>MapperConfiguration</c> sınıfı ile aynı kullanım biçimini sunar:
+/// <code>
+/// var config = new MapperConfiguration(cfg =&gt;
+/// {
+///     cfg.AddProfile&lt;OrderProfile&gt;();
+///     cfg.CreateMap&lt;Customer, CustomerDto&gt;();
+/// });
+/// config.AssertConfigurationIsValid();
+/// IMapper mapper = config.CreateMapper();
+/// </code>
+/// Derlenmiş eşleştirme delegeleri bu nesnede önbelleklenir ve tüm mapper örnekleri tarafından paylaşılır.
+/// Uygulama ömrü boyunca tek örnek (singleton) olarak kullanılmalıdır.
 /// </summary>
-public sealed class VeloxMapperOptions
+public sealed class MapperConfiguration : IConfigurationProvider
 {
-    /// <summary>Patch mapping davranışı yapılandırması (opt-in).</summary>
-    public PatchMappingOptions PatchMapping { get; } = new();
+    private static readonly MethodInfo QueryableSelectMethod = typeof(Queryable).GetMethods()
+        .First(m => m.Name == nameof(Queryable.Select) && m.GetParameters()[1].ParameterType.GetGenericArguments()[0].GetGenericArguments().Length == 2);
 
-    /// <summary>İsteğe bağlı diagnostics/loglama havuzu. Null ise sıfır maliyet.</summary>
-    public IVeloxDiagnosticsSink? DiagnosticsSink { get; set; }
+    private readonly ConcurrentDictionary<(Type, Type), MappingRegistration> _registrations = new();
+    private readonly List<MappingRegistration> _openGenericRegistrations = new();
+    private readonly ConcurrentDictionary<(Type, Type), RegistrationLookup> _lookupCache = new();
+    private readonly ConcurrentDictionary<(Type, Type, int), Lazy<Delegate>> _delegates = new();
+    private readonly ConcurrentDictionary<(Type, Type, string), Lazy<LambdaExpression>> _projections = new();
+    private readonly Dictionary<string, ProfileMap> _profiles = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<(Type, Type), bool> _precompiledPairs = new();
 
-    /// <summary>Özel isimlendirme kuralı (isteğe bağlı).</summary>
-    public ICustomNamingConvention? NamingConvention { get; set; }
-
-    /// <summary>Kaynak özellik isimlendirme kuralı (isteğe bağlı).</summary>
-    public ICustomNamingConvention? SourceMemberNamingConvention { get; set; }
-
-    /// <summary>Hedef özellik isimlendirme kuralı (isteğe bağlı).</summary>
-    public ICustomNamingConvention? DestinationMemberNamingConvention { get; set; }
-
-    /// <summary>Global value transformer koleksiyonu.</summary>
-    public ValueTransformerCollection ValueTransformers { get; } = new();
-
-    internal Dictionary<string, ValueTransformerCollection> ProfileValueTransformers { get; } = new();
-
-    /// <summary>Global düzeyde yoksayılacak property adları listesi.</summary>
-    internal HashSet<string> GlobalIgnores { get; } = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>Kaynak property adlarında tanınacak ön ekler listesi.</summary>
-    internal List<string> Prefixes { get; } = new();
-
-    /// <summary>Hedef property adlarında tanınacak ön ekler listesi.</summary>
-    internal List<string> DestinationPrefixes { get; } = new();
-
-    /// <summary>Property adlarında tanınacak son ekler listesi.</summary>
-    internal List<string> Postfixes { get; } = new();
-
-    /// <summary>Hedef property adlarında tanınacak son ekler listesi.</summary>
-    internal List<string> DestinationPostfixes { get; } = new();
-
-    /// <summary>Null koleksiyonların boş koleksiyon yerine null olarak map edilmesini sağlar.</summary>
-    public bool AllowNullCollections { get; set; }
-
-    /// <summary>Hangi property'lerin map edileceğini filtreleyen global delege.</summary>
-    public Func<PropertyInfo, bool> ShouldMapProperty { get; set; } = p => p.GetMethod != null && p.GetMethod.IsPublic;
-
-    /// <summary>Hangi field'ların map edileceğini filtreleyen global delege.</summary>
-    public Func<FieldInfo, bool> ShouldMapField { get; set; } = f => false;
-
-    /// <summary>Tüm mapping kayıtlarına uygulanacak toplu kural delegeleri.</summary>
-    internal List<Action<MappingRegistration>> ForAllMapsActions { get; } = new();
+    /// <summary>Tür çifti için Source Generator ile üretilmiş bir eşleştirme kayıtlıysa <c>true</c> (iç üyeler satır içi derlenmez).</summary>
+    internal bool IsPrecompiled(Type sourceType, Type destinationType) => _precompiledPairs.ContainsKey((sourceType, destinationType));
 
     /// <summary>
-    /// Belirtilen property adını tüm mapping'lerde yoksayar.
+    /// Yapılandırma delegesi ile oluşturur. AutoMapper'daki <c>new MapperConfiguration(cfg =&gt; ...)</c> ile aynıdır.
     /// </summary>
-    public void AddGlobalIgnore(string propertyName)
+    /// <param name="configure">Yapılandırma.</param>
+    public MapperConfiguration(Action<VeloxMapperOptions> configure)
+        : this(configure, loggerFactory: null)
     {
-        if (string.IsNullOrWhiteSpace(propertyName)) return;
-        GlobalIgnores.Add(propertyName);
     }
 
     /// <summary>
-    /// Belirtilen property adlarını tüm mapping'lerde yoksayar.
+    /// Yapılandırma delegesi ve log fabrikası ile oluşturur (AutoMapper 15 imzası ile uyumlu). Log fabrikası verilirse
+    /// ifade üretimi ve teşhis olayları <c>VeloxMapper</c> kategorisinde loglanır.
     /// </summary>
-    public void AddGlobalIgnore(params string[] propertyNames)
+    /// <param name="configure">Yapılandırma.</param>
+    /// <param name="loggerFactory">Log fabrikası (isteğe bağlı).</param>
+    public MapperConfiguration(Action<VeloxMapperOptions> configure, ILoggerFactory? loggerFactory)
+        : this(Configure(configure), loggerFactory)
     {
-        if (propertyNames == null) return;
-        foreach (var name in propertyNames)
-        {
-            AddGlobalIgnore(name);
-        }
     }
 
     /// <summary>
-    /// Kaynak property adlarında aranacak ve eşleşme sırasında çıkarılacak ön ekleri ekler.
+    /// Önceden doldurulmuş bir yapılandırma ifadesinden oluşturur.
     /// </summary>
-    public void RecognizePrefixes(params string[] prefixes)
+    /// <param name="options">Yapılandırma ifadesi.</param>
+    public MapperConfiguration(VeloxMapperOptions options)
+        : this(options, loggerFactory: null)
     {
-        if (prefixes == null) return;
-        Prefixes.AddRange(prefixes);
     }
 
     /// <summary>
-    /// Hedef property adlarında aranacak ve eşleşme sırasında çıkarılacak ön ekleri ekler.
+    /// Önceden doldurulmuş bir yapılandırma ifadesi ve log fabrikasıyla oluşturur.
     /// </summary>
-    public void RecognizeDestinationPrefixes(params string[] prefixes)
+    /// <param name="options">Yapılandırma ifadesi.</param>
+    /// <param name="loggerFactory">Log fabrikası (isteğe bağlı).</param>
+    public MapperConfiguration(VeloxMapperOptions options, ILoggerFactory? loggerFactory)
     {
-        if (prefixes == null) return;
-        DestinationPrefixes.AddRange(prefixes);
+        if (options == null) throw new ArgumentNullException(nameof(options));
+
+        IgnoreNullValues = options.PatchMapping.IgnoreNullValues;
+        DiagnosticsSink = options.DiagnosticsSink ?? (loggerFactory != null ? new LoggerDiagnosticsSink(loggerFactory.CreateLogger("VeloxMapper")) : null);
+        ServiceCtor = options.ServiceCtor;
+        DefaultProfile = ProfileMap.Create(null, options.Global, options.NamingConvention);
+
+        Initialize(options);
     }
 
     /// <summary>
-    /// Property adlarında aranacak ve eşleşme sırasında çıkarılacak son ekleri ekler.
+    /// Verilen assembly'lerdeki profilleri ve <c>[AutoMap]</c> özniteliklerini tarayarak oluşturur.
     /// </summary>
-    public void RecognizePostfixes(params string[] postfixes)
+    /// <param name="assemblies">Taranacak assembly'ler.</param>
+    public MapperConfiguration(params Assembly[] assemblies)
+        : this(cfg => cfg.AddMaps(assemblies ?? throw new ArgumentNullException(nameof(assemblies))))
     {
-        if (postfixes == null) return;
-        Postfixes.AddRange(postfixes);
     }
 
-    /// <summary>
-    /// Hedef property adlarında aranacak ve eşleşme sırasında çıkarılacak son ekleri ekler.
-    /// </summary>
-    public void RecognizeDestinationPostfixes(params string[] postfixes)
-    {
-        if (postfixes == null) return;
-        DestinationPostfixes.AddRange(postfixes);
-    }
-
-    /// <summary>
-    /// Kaynak ve hedef property adlarından aranacak tüm ön ek listesini temizler.
-    /// </summary>
-    public void ClearPrefixes()
-    {
-        Prefixes.Clear();
-        DestinationPrefixes.Clear();
-    }
-
-    /// <summary>
-    /// Tüm eşleştirme kurallarına toplu olarak kural uygulamak için bir delege kaydeder.
-    /// </summary>
-    public void ForAllMaps(Action<MappingRegistration> configure)
+    private static VeloxMapperOptions Configure(Action<VeloxMapperOptions> configure)
     {
         if (configure == null) throw new ArgumentNullException(nameof(configure));
-        ForAllMapsActions.Add(configure);
-    }
-
-    // --- Dahili depolar ---
-
-    // Tip dönüştürücülerin dahili deposu
-    internal Dictionary<(Type Source, Type Destination), object> Converters { get; } = new();
-
-    // Profil ve inline CreateMap çağrılarından toplanan kayıtlar
-    internal List<MappingRegistration> Registrations { get; } = new();
-
-    // CreateMap ile oluşturulan MappingExpression'lar — Build işlemi sırasında Registration'a dönüştürülür
-    private readonly List<Func<string?, MappingRegistration>> _inlineFactories = new();
-
-    /// <summary>
-    /// Belirtilen kaynak-hedef tür çifti için özel bir tip dönüştürücü kaydeder.
-    /// Aynı çift ikinci kez eklenemez (fail-fast).
-    /// </summary>
-    public void AddCustomConverter<TSource, TDestination>(IVeloxTypeConverter<TSource, TDestination> converter)
-    {
-        ArgumentNullException.ThrowIfNull(converter);
-
-        var key = (typeof(TSource), typeof(TDestination));
-        if (Converters.ContainsKey(key))
-        {
-            throw new VeloxConfigurationException(
-                $"'{typeof(TSource).FullName}' -> '{typeof(TDestination).FullName}' çifti için özel dönüştürücü zaten kayıtlı.");
-        }
-
-        Converters[key] = converter;
-    }
-
-    /// <summary>
-    /// Belirtilen profil tipini ekler ve içindeki tüm eşleştirme kayıtlarını toplar.
-    /// </summary>
-    /// <typeparam name="TProfile">VeloxProfile alt sınıfı</typeparam>
-    public void AddProfile<TProfile>() where TProfile : VeloxProfile, new()
-    {
-        AddProfile(new TProfile());
-    }
-
-    /// <summary>
-    /// Verilen profil örneğini ekler ve içindeki tüm eşleştirme kayıtlarını toplar.
-    /// </summary>
-    public void AddProfile(VeloxProfile profile)
-    {
-        ArgumentNullException.ThrowIfNull(profile);
-
-        var profileRegistrations = profile.BuildRegistrations();
-        Registrations.AddRange(profileRegistrations);
-
-        var profileName = profile.GetType().Name;
-        ProfileValueTransformers[profileName] = profile.ProfileValueTransformers;
-    }
-
-    /// <summary>
-    /// Belirtilen assembly'deki tüm <see cref="VeloxProfile"/> alt sınıflarını otomatik bulur ve kaydeder.
-    /// AutoMapper'ın assembly scanning özelliğinin VeloxMapper karşılığıdır.
-    /// </summary>
-    /// <param name="assembly">Taranacak assembly</param>
-    public void AddProfilesFromAssembly(Assembly assembly)
-    {
-        ArgumentNullException.ThrowIfNull(assembly);
-
-        // Assembly'deki tüm somut (non-abstract) VeloxProfile alt sınıflarını bul
-        var profileTypes = assembly.GetTypes()
-            .Where(t => typeof(VeloxProfile).IsAssignableFrom(t)
-                        && !t.IsAbstract
-                        && t.GetConstructor(Type.EmptyTypes) != null);
-
-        foreach (var profileType in profileTypes)
-        {
-            var profile = (VeloxProfile)Activator.CreateInstance(profileType)!;
-            AddProfile(profile);
-        }
-    }
-
-    /// <summary>
-    /// Verilen tür parametresinin bulunduğu assembly'yi tarar.
-    /// <c>AddProfilesFromAssembly(typeof(T).Assembly)</c> için kısayol.
-    /// </summary>
-    /// <typeparam name="T">Assembly'deki herhangi bir tür</typeparam>
-    public void AddProfilesFromAssemblyOf<T>()
-    {
-        AddProfilesFromAssembly(typeof(T).Assembly);
-    }
-
-    /// <summary>
-    /// Birden fazla assembly'yi tarayarak tüm profilleri kaydeder.
-    /// </summary>
-    public void AddProfilesFromAssemblies(params Assembly[] assemblies)
-    {
-        ArgumentNullException.ThrowIfNull(assemblies);
-
-        foreach (var assembly in assemblies)
-        {
-            AddProfilesFromAssembly(assembly);
-        }
-    }
-
-    /// <summary>
-    /// Profil kullanmadan doğrudan bir kaynak-hedef eşleştirmesi tanımlar (inline kullanım).
-    /// </summary>
-    /// <typeparam name="TSource">Kaynak tür</typeparam>
-    /// <typeparam name="TDestination">Hedef tür</typeparam>
-    /// <returns>ForMember/Ignore/ConvertUsing zincirleme arayüzü</returns>
-    public IMappingExpression<TSource, TDestination> CreateMap<TSource, TDestination>()
-    {
-        var expression = new MappingExpression<TSource, TDestination>();
-        _inlineFactories.Add(profileName => expression.Build(profileName));
-        return expression;
-    }
-
-    /// <summary>
-    /// Tip nesneleri ile eşleştirme tanımlar. Özellikle Open Generic eşleştirmeleri için kullanılır (inline kullanım).
-    /// </summary>
-    /// <param name="sourceType">Kaynak türü</param>
-    /// <param name="destinationType">Hedef türü</param>
-    /// <returns>Fluent yapılandırma arayüzü</returns>
-    public IMappingExpression CreateMap(Type sourceType, Type destinationType)
-    {
-        if (sourceType is null)
-        {
-            throw new ArgumentNullException(nameof(sourceType)); // Kaynak tür null olamaz.
-        }
-        if (destinationType is null)
-        {
-            throw new ArgumentNullException(nameof(destinationType)); // Hedef tür null olamaz.
-        }
-
-        // Açık generic (Open Generic) tipler için özel expression oluşturulur
-        if (sourceType.IsGenericTypeDefinition || destinationType.IsGenericTypeDefinition)
-        {
-            var openExpr = new OpenGenericMappingExpression(sourceType, destinationType);
-            _inlineFactories.Add(profileName => openExpr.Build(profileName));
-            return openExpr;
-        }
-
-        var expressionType = typeof(MappingExpression<,>).MakeGenericType(sourceType, destinationType);
-        var expression = (IMappingExpression)Activator.CreateInstance(expressionType)!;
-
-        _inlineFactories.Add(profileName => {
-            var buildMethod = expressionType.GetMethod("Build", BindingFlags.NonPublic | BindingFlags.Instance)!;
-            return (MappingRegistration)buildMethod.Invoke(expression, [profileName])!;
-        });
-
-        return expression;
-    }
-
-    /// <summary>
-    /// Inline CreateMap çağrılarını MappingRegistration'a dönüştürür.
-    /// MapperConfiguration oluşturulurken çağrılır.
-    /// </summary>
-    internal void FinalizeInlineRegistrations()
-    {
-        foreach (var factory in _inlineFactories)
-        {
-            Registrations.Add(factory(null)); // inline kayıtların profil adı yok
-        }
-    }
-}
-
-/// <summary>
-/// Tüm çalışma zamanı yapılandırmasını saklayan, dondurulmuş (immutable) kurallar kümesidir.
-/// Oluşturulduktan sonra değiştirilemez — fail-fast prensibi.
-/// <para>
-/// Desteklenen kullanımlar:
-/// <code>
-/// // 1. Yapılandırma delegesi ile
-/// var config = new MapperConfiguration(options =&gt; { ... });
-///
-/// // 2. Assembly scanning ile (kısayol)
-/// var config = new MapperConfiguration(typeof(Program).Assembly);
-///
-/// // 3. Birden fazla assembly ile
-/// var config = new MapperConfiguration(assembly1, assembly2);
-/// </code>
-/// </para>
-/// </summary>
-public sealed class MapperConfiguration
-{
-    private readonly bool _ignoreNullValues;
-    private readonly IVeloxDiagnosticsSink? _diagnosticsSink;
-    private readonly ICustomNamingConvention? _namingConvention;
-    private readonly ICustomNamingConvention? _sourceMemberNamingConvention;
-    private readonly ICustomNamingConvention? _destinationMemberNamingConvention;
-    private readonly Dictionary<(Type, Type), object> _converters;
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(Type, Type), MappingRegistration> _registrations;
-    private readonly HashSet<string> _globalIgnores;
-    private readonly List<string> _prefixes;
-    private readonly List<string> _destinationPrefixes;
-    private readonly List<string> _postfixes;
-    private readonly List<string> _destinationPostfixes;
-    private readonly bool _allowNullCollections;
-    private readonly Func<PropertyInfo, bool> _shouldMapProperty;
-    private readonly Func<FieldInfo, bool> _shouldMapField;
-
-    /// <summary>
-    /// Önceden derlenmiş (precompiled) Source Generator eşleştirmelerini tutan thread-safe sözlük.
-    /// </summary>
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<(Type Source, Type Destination), Delegate> _precompiledMappers = new();
-
-    /// <summary>Patch modunda null değerlerin atlanıp atlanmayacağını belirler.</summary>
-    public bool IgnoreNullValues => _ignoreNullValues;
-
-    /// <summary>Diagnostics/loglama havuzu (null olabilir).</summary>
-    public IVeloxDiagnosticsSink? DiagnosticsSink => _diagnosticsSink;
-
-    /// <summary>Özel isimlendirme kuralı (null olabilir).</summary>
-    public ICustomNamingConvention? NamingConvention => _namingConvention;
-
-    /// <summary>Kaynak özellik isimlendirme kuralı (null olabilir).</summary>
-    public ICustomNamingConvention? SourceMemberNamingConvention => _sourceMemberNamingConvention;
-
-    /// <summary>Hedef özellik isimlendirme kuralı (null olabilir).</summary>
-    public ICustomNamingConvention? DestinationMemberNamingConvention => _destinationMemberNamingConvention;
-
-    private readonly ValueTransformerCollection _globalValueTransformers;
-    private readonly Dictionary<string, ValueTransformerCollection> _profileValueTransformers;
-
-    /// <summary>Global value transformer koleksiyonu.</summary>
-    public ValueTransformerCollection GlobalValueTransformers => _globalValueTransformers;
-
-    /// <summary>Profil bazlı value transformer koleksiyonu.</summary>
-    public IReadOnlyDictionary<string, ValueTransformerCollection> ProfileValueTransformers => _profileValueTransformers;
-
-    /// <summary>Global düzeyde yoksayılacak property adları.</summary>
-    public IReadOnlyCollection<string> GlobalIgnores => _globalIgnores;
-
-    /// <summary>Kaynak property adlarında tanınacak ön ekler.</summary>
-    public IReadOnlyList<string> Prefixes => _prefixes;
-
-    /// <summary>Hedef property adlarında tanınacak ön ekler.</summary>
-    public IReadOnlyList<string> DestinationPrefixes => _destinationPrefixes;
-
-    /// <summary>Property adlarında tanınacak son ekler.</summary>
-    public IReadOnlyList<string> Postfixes => _postfixes;
-
-    /// <summary>Hedef property adlarında tanınacak son ekler.</summary>
-    public IReadOnlyList<string> DestinationPostfixes => _destinationPostfixes;
-
-    /// <summary>Null koleksiyonların boş koleksiyon yerine null olarak map edilmesini sağlar.</summary>
-    public bool AllowNullCollections => _allowNullCollections;
-
-    /// <summary>Hangi property'lerin map edileceğini filtreleyen global delege.</summary>
-    public Func<PropertyInfo, bool> ShouldMapProperty => _shouldMapProperty;
-
-    /// <summary>Hangi field'ların map edileceğini filtreleyen global delege.</summary>
-    public Func<FieldInfo, bool> ShouldMapField => _shouldMapField;
-
-    /// <summary>Kayıtlı eşleştirme sayısı (diagnostics için).</summary>
-    public int RegistrationCount => _registrations.Count;
-
-    /// <summary>
-    /// Source Generator (Layer 1) tarafından üretilmiş önceden derlenmiş (precompiled) eşleştirme fonksiyonunu kaydeder.
-    /// </summary>
-    /// <typeparam name="TSource">Kaynak türü</typeparam>
-    /// <typeparam name="TDestination">Hedef türü</typeparam>
-    /// <param name="mapFunc">Eşleştirme fonksiyonu</param>
-    public void RegisterPrecompiledMapper<TSource, TDestination>(Func<TSource, TDestination> mapFunc)
-    {
-        ArgumentNullException.ThrowIfNull(mapFunc);
-        _precompiledMappers[(typeof(TSource), typeof(TDestination))] = mapFunc;
-    }
-
-    /// <summary>
-    /// Belirtilen kaynak ve hedef türü için kayıtlı önceden derlenmiş (precompiled) mapper delegesini döndürür.
-    /// Bulunamazsa null döner.
-    /// </summary>
-    internal Delegate? GetPrecompiledMapper(Type sourceType, Type destinationType)
-    {
-        sourceType = Mapper.GetUnproxiedType(sourceType);
-        destinationType = Mapper.GetUnproxiedType(destinationType);
-        return _precompiledMappers.TryGetValue((sourceType, destinationType), out var mapper) ? mapper : null;
-    }
-
-    /// <summary>
-    /// Yapılandırma delegesi ile oluşturur.
-    /// </summary>
-    public MapperConfiguration(Action<VeloxMapperOptions> configure)
-    {
-        ArgumentNullException.ThrowIfNull(configure);
-
         var options = new VeloxMapperOptions();
         configure(options);
-
-        // Inline CreateMap kayıtlarını sonlandır
-        options.FinalizeInlineRegistrations();
-
-        // Fail-Fast: Yapılandırma doğrulamaları
-        _ignoreNullValues = options.PatchMapping.IgnoreNullValues;
-        _diagnosticsSink = options.DiagnosticsSink;
-        _namingConvention = options.NamingConvention;
-        _sourceMemberNamingConvention = options.SourceMemberNamingConvention ?? options.NamingConvention;
-        _destinationMemberNamingConvention = options.DestinationMemberNamingConvention ?? options.NamingConvention;
-        _globalValueTransformers = options.ValueTransformers;
-        _profileValueTransformers = new Dictionary<string, ValueTransformerCollection>(options.ProfileValueTransformers);
-        _globalIgnores = new HashSet<string>(options.GlobalIgnores, StringComparer.OrdinalIgnoreCase);
-        _prefixes = new List<string>(options.Prefixes);
-        _destinationPrefixes = new List<string>(options.DestinationPrefixes);
-        _postfixes = new List<string>(options.Postfixes);
-        _destinationPostfixes = new List<string>(options.DestinationPostfixes);
-        _allowNullCollections = options.AllowNullCollections;
-        _shouldMapProperty = options.ShouldMapProperty ?? (p => p.GetMethod != null && p.GetMethod.IsPublic);
-        _shouldMapField = options.ShouldMapField ?? (f => false);
-
-        // Converter sözlüğünü dondur
-        _converters = new Dictionary<(Type, Type), object>(options.Converters);
-
-        // Global ForAllMaps kurallarını kayıtlara uygula
-        foreach (var reg in options.Registrations)
-        {
-            foreach (var action in options.ForAllMapsActions)
-            {
-                action(reg);
-            }
-            reg.RecalculateRequiresContext();
-        }
-
-        // Kayıtları (profil + inline) dondur
-        _registrations = new System.Collections.Concurrent.ConcurrentDictionary<(Type, Type), MappingRegistration>();
-        foreach (var reg in options.Registrations)
-        {
-            var key = (reg.SourceType, reg.DestinationType);
-
-            // Aynı kaynak-hedef çifti farklı profillerde tanımlanmışsa — fail-fast
-            if (_registrations.ContainsKey(key))
-            {
-                var existing = _registrations[key];
-                throw new VeloxConfigurationException(
-                    $"'{reg.SourceType.FullName}' -> '{reg.DestinationType.FullName}' eşleştirmesi birden fazla yerde tanımlanmış. " +
-                    $"Mevcut: [{existing.ProfileName ?? "Inline"}], Yeni: [{reg.ProfileName ?? "Inline"}]. " +
-                    $"Her eşleştirme çifti yalnızca bir kez tanımlanabilir.");
-            }
-
-            _registrations[key] = reg;
-
-            // Eğer MappingRegistration'da CustomConverter varsa, _converters'a da ekle
-            if (reg.CustomConverter != null && !_converters.ContainsKey(key))
-            {
-                _converters[key] = reg.CustomConverter;
-            }
-        }
-
-        // IsReverseMapRequested olan kayıtlar için ters yön kayıtlarını otomatik ekle
-        var explicitRegistrations = _registrations.Values.ToList();
-        foreach (var reg in explicitRegistrations)
-        {
-            if (reg.IsReverseMapRequested)
-            {
-                var reverseKey = (reg.DestinationType, reg.SourceType);
-                if (!_registrations.ContainsKey(reverseKey))
-                {
-                    var reverseReg = MappingRegistration.CreateReverse(reg);
-                    _registrations[reverseKey] = reverseReg;
-                }
-            }
-        }
-
-        // IncludeAllDerived kurallarını otomatik çözümle
-        ApplyIncludeAllDerivedMappings();
-
-        // IncludeBase miras kurallarını uygula
-        ApplyBaseTypeMappings();
-
-        // Performans Optimizasyonu: Kayıtların context (ResolutionContext) gereksinimlerini derinlemesine optimize et
-        OptimizeRequiresContext();
+        return options;
     }
 
-    /// <summary>
-    /// Assembly scanning kısayolu — verilen assembly'lerdeki tüm VeloxProfile alt sınıflarını bulur.
-    /// </summary>
-    public MapperConfiguration(Assembly[] assemblies)
-        : this(cfg =>
-        {
-            if (assemblies == null) throw new ArgumentNullException(nameof(assemblies));
-            foreach (var assembly in assemblies)
-            {
-                cfg.AddProfilesFromAssembly(assembly);
-            }
-        })
-    {
-    }
+    // ─── Ayarlar ────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Belirtilen kaynak ve hedef tür çifti için eşleştirme planını çıkarır.
-    /// </summary>
-    /// <param name="source">Kaynak tür</param>
-    /// <param name="destination">Hedef tür</param>
-    /// <param name="mode">Haritalama modu (varsayılan: Map)</param>
-    /// <returns>Detaylı haritalama planı</returns>
-    public MappingPlanDef GetMappingPlan(Type source, Type destination, MappingMode mode = MappingMode.Map)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        ArgumentNullException.ThrowIfNull(destination);
+    /// <summary>Mevcut nesneye eşlemede null kaynak değerlerinin atlanıp atlanmayacağı.</summary>
+    public bool IgnoreNullValues { get; }
 
-        var plan = new MappingPlanDef
+    /// <summary>Teşhis log hedefi.</summary>
+    public IVeloxDiagnosticsSink? DiagnosticsSink { get; }
+
+    /// <summary>Tür çifti kaydı sayısı (ters eşleştirmeler dahil, open generic tanımlar hariç).</summary>
+    public int RegistrationCount => _registrations.Values.Count(r => !IsOpenGeneric(r));
+
+    internal ProfileMap DefaultProfile { get; }
+
+    internal Func<Type, object>? ServiceCtor { get; }
+
+    internal ProfileMap GetProfile(MappingRegistration? registration) => registration?.Profile ?? DefaultProfile;
+
+    /// <summary>Tüm eşleştirme kayıtları (open generic tanımlar hariç).</summary>
+    public IReadOnlyCollection<TypeMap> GetAllTypeMaps()
+        => _registrations.Values.Where(r => !IsOpenGeneric(r)).Select(r => new TypeMap(r.SourceType, r.DestinationType, r.ProfileName)).ToList();
+
+    internal IEnumerable<MappingRegistration> GetAllRegistrations() => _registrations.Values.Where(r => !IsOpenGeneric(r));
+
+    // ─── Başlatma ───────────────────────────────────────────────────────────
+
+    private void Initialize(VeloxMapperOptions options)
+    {
+        var sources = new List<(ProfileConfiguration Configuration, string? Name, ProfileMap Map)>
         {
-            SourceType = source.FullName ?? source.Name,
-            DestinationType = destination.FullName ?? destination.Name,
-            Mode = mode
+            (options.Global, null, DefaultProfile)
         };
 
-        var reg = GetRegistration(source, destination);
-        if (reg != null)
+        foreach (var profile in options.Profiles)
         {
-            plan.ProfileName = reg.ProfileName ?? "";
+            var map = ProfileMap.Create(profile.Configuration, options.Global, options.NamingConvention);
+            _profiles[profile.ProfileName] = map;
+            sources.Add((profile.Configuration, profile.ProfileName, map));
         }
 
-        var properties = new List<MappedPropertyDesc>();
-        var sourceProps = source.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Where(ShouldMapProperty).ToArray();
-        var destProps = destination.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(p => p.CanWrite && ShouldMapProperty(p))
-            .ToArray();
-
-        foreach (var destProp in destProps)
+        // 1. AutoMapper tarzı ForAllMaps: ifadeler kayda dönüşmeden önce uygulanır
+        foreach (var (configuration, name, _) in sources)
         {
-            var desc = new MappedPropertyDesc
+            foreach (var builder in configuration.Maps)
             {
-                TargetProperty = destProp.Name
-            };
-
-            if (_globalIgnores.Contains(destProp.Name))
-            {
-                desc.SourceProperty = "Ignored";
-                desc.ExecutionType = "Ignored";
-            }
-            else if (reg != null && reg.MemberRules.TryGetValue(destProp.Name, out var rule))
-            {
-                if (rule.IsIgnored || rule.IsDoNotValidate)
+                var typeMap = new TypeMap(builder.SourceType, builder.DestinationType, name);
+                foreach (var action in options.Global.ForAllMapsActions) action(typeMap, builder.AsNonGeneric);
+                if (!ReferenceEquals(configuration, options.Global))
                 {
-                    desc.SourceProperty = "Ignored";
-                    desc.ExecutionType = "Ignored";
-                }
-                else if (rule.MapFromExpression != null)
-                {
-                    desc.SourceProperty = rule.MapFromExpression.ToString();
-                    desc.ExecutionType = "Complex";
+                    foreach (var action in configuration.ForAllMapsActions) action(typeMap, builder.AsNonGeneric);
                 }
             }
-            else
-            {
-                var srcProp = sourceProps.FirstOrDefault(s =>
-                    Execution.NameMatchingHelper.IsMatch(s.Name, destProp.Name, this));
-
-                if (srcProp != null)
-                {
-                    desc.SourceProperty = srcProp.Name;
-                    desc.ExecutionType = "Assigned";
-                }
-                else if (CanFlatten(source, destProp.Name))
-                {
-                    desc.SourceProperty = destProp.Name;
-                    desc.ExecutionType = "Flattened";
-                }
-                else
-                {
-                    desc.SourceProperty = "None";
-                    desc.ExecutionType = "Unmapped";
-                }
-            }
-
-            properties.Add(desc);
         }
 
-        plan.Properties = properties.ToArray();
-        return plan;
-    }
-
-    /// <summary>
-    /// Tüm kayıtlı eşleştirmelerin geçerliliğini doğrular.
-    /// Eşleştirilemeyen property'ler, uyumsuz türler veya eksik converter'lar tespit edilirse
-    /// <see cref="VeloxValidationException"/> fırlatır.
-    /// Startup/CI pipeline'da çağrılması önerilir.
-    /// </summary>
-    public void AssertConfigurationIsValid()
-    {
-        var errors = new List<string>();
-
-        foreach (var kvp in _registrations)
+        // 2. Kayıtları üret (açık tanımlar ReverseMap ile üretilenlere üstün gelir)
+        var generated = new List<MappingRegistration>();
+        foreach (var (configuration, name, map) in sources)
         {
-            var reg = kvp.Value;
-
-            // Özel dönüştürücü varsa property eşleştirmesi kontrolü atlanır
-            if (reg.CustomConverter != null) continue;
-
-            // Kaynak tür Dictionary ise property doğrulaması atlanır
-            if (typeof(System.Collections.IDictionary).IsAssignableFrom(reg.SourceType)) continue;
-
-            var sourceProps = reg.SourceType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Where(ShouldMapProperty).ToArray();
-            var destProps = reg.DestinationType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(p => p.CanWrite && ShouldMapProperty(p))
-                .ToArray();
-
-            foreach (var destProp in destProps)
+            foreach (var builder in configuration.Maps)
             {
-                // Global ignore edilmişse atla
-                if (_globalIgnores.Contains(destProp.Name))
-                    continue;
-
-                // Ignore veya DoNotValidate edilmiş property'leri atla
-                if (reg.MemberRules.TryGetValue(destProp.Name, out var rule) && (rule.IsIgnored || rule.IsDoNotValidate))
-                    continue;
-
-                // MapFrom ile özel kaynak belirtilmişse OK
-                if (reg.MemberRules.TryGetValue(destProp.Name, out var mapRule) && mapRule.MapFromExpression != null)
-                    continue;
-
-                // ForPath kuralları tarafından kapsanan bir property ise OK
-                if (reg.ForPathRules != null && reg.ForPathRules.Any(r => r.PathSegments != null && r.PathSegments.Length > 0 && string.Equals(r.PathSegments[0], destProp.Name, StringComparison.OrdinalIgnoreCase)))
-                    continue;
-
-                // İsimle eşleşen kaynak property ara
-                var srcProp = sourceProps.FirstOrDefault(s =>
-                    Execution.NameMatchingHelper.IsMatch(s.Name, destProp.Name, this));
-
-                if (srcProp == null)
+                foreach (var registration in builder.Build(name))
                 {
-                    // Flattening ile eşleşebilir mi kontrol et
-                    if (!CanFlatten(reg.SourceType, destProp.Name))
+                    registration.Profile = map;
+                    if (registration.IsGeneratedReverse)
                     {
-                        errors.Add(
-                            $"[{reg.ProfileName ?? "Inline"}] {reg.SourceType.Name} -> {reg.DestinationType.Name}: " +
-                            $"Hedef property '{destProp.Name}' için kaynak bulunamadı. " +
-                            $"ForMember ile MapFrom veya Ignore kullanın.");
+                        generated.Add(registration);
+                        continue;
                     }
-                }
-                else if (!destProp.PropertyType.IsAssignableFrom(srcProp.PropertyType))
-                {
-                    // Tür uyumluluğunu kontrol et (temel kontrol)
-                    // Enum dönüşümü veya nullable wrapper'ı olabilir — bunları izin ver
-                    if (!IsCompatibleType(srcProp.PropertyType, destProp.PropertyType))
-                    {
-                        errors.Add(
-                            $"[{reg.ProfileName ?? "Inline"}] {reg.SourceType.Name} -> {reg.DestinationType.Name}: " +
-                            $"'{destProp.Name}' property tipi uyumsuz: " +
-                            $"{srcProp.PropertyType.Name} -> {destProp.PropertyType.Name}.");
-                    }
+
+                    AddRegistration(registration);
                 }
             }
         }
 
-        if (errors.Count > 0)
+        foreach (var registration in generated)
         {
-            throw new VeloxValidationException(
-                $"VeloxMapper yapılandırma doğrulaması başarısız — {errors.Count} hata bulundu:\n" +
-                string.Join("\n", errors.Select((e, i) => $"  {i + 1}. {e}")));
+            var key = (registration.SourceType, registration.DestinationType);
+            if (!_registrations.ContainsKey(key)) AddRegistration(registration);
         }
+
+        // 3. ForAllPropertyMaps
+        foreach (var registration in _registrations.Values.ToList())
+        {
+            if (IsOpenGeneric(registration)) continue;
+            var actions = options.Global.ForAllPropertyMapsActions.AsEnumerable();
+            var profileConfiguration = options.Profiles.FirstOrDefault(p => p.ProfileName == registration.ProfileName)?.Configuration;
+            if (profileConfiguration != null) actions = actions.Concat(profileConfiguration.ForAllPropertyMapsActions);
+            var actionList = actions.ToList();
+            if (actionList.Count > 0) ApplyPropertyMapActions(registration, actionList);
+        }
+
+        // 4. VeloxMapper 5.x tarzı ForAllMaps (dondurulmuş kayıtlar üzerinde)
+        foreach (var registration in _registrations.Values)
+        {
+            foreach (var action in options.RegistrationActions) action(registration);
+        }
+
+        // 5. Kalıtım: IncludeAllDerived → Include → IncludeBase birleştirme
+        ResolveIncludeAllDerived();
+        ResolveInheritance();
+
+        // 6. Döngüsel tür grafiklerinde referans koruması (AutoMapper davranışı)
+        EnablePreserveReferencesForCycles();
     }
 
-    /// <summary>
-    /// IsIncludeAllDerivedRequested bayrağı set edilmiş kayıtları tarar
-    /// ve alt sınıf eşleştirmelerini otomatik polimorfik haritalamaya (Include) bağlar.
-    /// </summary>
-    private void ApplyIncludeAllDerivedMappings()
+    private void AddRegistration(MappingRegistration registration)
     {
-        var allRegs = _registrations.Values.ToList();
-        foreach (var reg in allRegs)
+        var key = (registration.SourceType, registration.DestinationType);
+        if (_registrations.TryGetValue(key, out var existing))
         {
-            if (reg.IsIncludeAllDerivedRequested)
+            throw new VeloxConfigurationException(
+                $"'{registration.SourceType.FullName}' -> '{registration.DestinationType.FullName}' eşleştirmesi birden fazla kez tanımlanmış " +
+                $"([{existing.ProfileName ?? "Global"}] ve [{registration.ProfileName ?? "Global"}]). Her tür çifti yalnızca bir kez tanımlanabilir.");
+        }
+
+        _registrations[key] = registration;
+        if (IsOpenGeneric(registration)) _openGenericRegistrations.Add(registration);
+    }
+
+    private static bool IsOpenGeneric(MappingRegistration registration)
+        => registration.SourceType.IsGenericTypeDefinition || registration.DestinationType.IsGenericTypeDefinition;
+
+    private void ApplyPropertyMapActions(MappingRegistration registration,
+        List<KeyValuePair<Func<PropertyMap, bool>, Action<PropertyMap, IMemberConfigurationExpression>>> actions)
+    {
+        var profile = GetProfile(registration);
+        var typeMap = new TypeMap(registration.SourceType, registration.DestinationType, registration.ProfileName);
+        foreach (var member in TypeMembers.GetDestinationMembers(registration.DestinationType, profile))
+        {
+            var sourceMember = ConventionResolver.FindDirect(registration.SourceType, member.Name, profile);
+            var propertyMap = new PropertyMap(typeMap, member, TypeMembers.GetMemberType(member), sourceMember);
+            foreach (var action in actions)
             {
-                foreach (var otherReg in allRegs)
+                if (!action.Key(propertyMap)) continue;
+                if (!registration.MutableMemberRules.TryGetValue(member.Name, out var rule))
                 {
-                    if (otherReg == reg) continue;
+                    rule = new MemberMappingRule(member.Name);
+                    registration.MutableMemberRules[member.Name] = rule;
+                }
 
-                    // Kaynak ve hedef türlerin her ikisi de derived ise otomatik Include kapsamına alıyoruz.
-                    bool isSourceDerived = reg.SourceType.IsAssignableFrom(otherReg.SourceType) && reg.SourceType != otherReg.SourceType;
-                    bool isDestDerived = reg.DestinationType.IsAssignableFrom(otherReg.DestinationType) && reg.DestinationType != otherReg.DestinationType;
-
-                    if (isSourceDerived && isDestDerived)
-                    {
-                        reg.AddIncludedDerivedType(otherReg.SourceType, otherReg.DestinationType);
-                    }
+                action.Value(propertyMap, new MemberConfigurationExpression(rule, member));
+                if (rule.SourceMemberPath != null)
+                {
+                    rule.MapFromExpression = MemberPath.BuildAccessor(registration.SourceType, rule.SourceMemberPath);
+                    rule.SourceMemberPath = null;
                 }
             }
         }
     }
 
-    /// <summary>
-    /// IncludeBase miras hiyerarşisini çözümler ve kuralları derived kayıtlarla birleştirir.
-    /// </summary>
-    private void ApplyBaseTypeMappings()
+    private void ResolveIncludeAllDerived()
     {
-        var visited = new HashSet<(Type, Type)>();
-        var keys = _registrations.Keys.ToList();
-
-        foreach (var key in keys)
+        var all = _registrations.Values.Where(r => !IsOpenGeneric(r)).ToList();
+        foreach (var registration in all.Where(r => r.IsIncludeAllDerivedRequested))
         {
-            ResolveInheritance(key, visited);
-        }
-    }
-
-    private void ResolveInheritance((Type Source, Type Destination) key, HashSet<(Type, Type)> visited)
-    {
-        if (!visited.Add(key)) return;
-
-        if (!_registrations.TryGetValue(key, out var reg)) return;
-
-        if (reg.BaseTypeMapping == null) return;
-
-        var baseKey = reg.BaseTypeMapping.Value;
-
-        // Önce base mapping'in miras zincirini çöz
-        ResolveInheritance(baseKey, visited);
-
-        if (_registrations.TryGetValue(baseKey, out var baseReg))
-        {
-            // Base registration'daki kuralları bu registration ile birleştir
-            var mergedReg = MergeRegistrations(baseReg, reg);
-            _registrations[key] = mergedReg;
-        }
-    }
-
-    private MappingRegistration MergeRegistrations(MappingRegistration baseReg, MappingRegistration derivedReg)
-    {
-        // 1. MemberRules birleştirme: derived kuralları base kurallarının üzerine yazar.
-        var mergedMemberRules = new Dictionary<string, MemberMappingRule>(baseReg.MemberRules);
-        foreach (var kvp in derivedReg.MemberRules)
-        {
-            mergedMemberRules[kvp.Key] = kvp.Value;
-        }
-
-        // 2. BeforeMap ve AfterMap eylemlerini birleştir
-        var mergedBefore = new List<object>(baseReg.BeforeMapActions);
-        mergedBefore.AddRange(derivedReg.BeforeMapActions);
-
-        var mergedAfter = new List<object>(baseReg.AfterMapActions);
-        mergedAfter.AddRange(derivedReg.AfterMapActions);
-
-        // 3. Diğer özellikleri birleştir
-        var customConverter = derivedReg.CustomConverter ?? baseReg.CustomConverter;
-        var factory = derivedReg.FactoryDelegate ?? baseReg.FactoryDelegate;
-        var condition = derivedReg.ForAllMembersCondition ?? baseReg.ForAllMembersCondition;
-        var maxDepth = derivedReg.MaxDepth > 0 ? derivedReg.MaxDepth : baseReg.MaxDepth;
-        var preserveReferences = derivedReg.PreserveReferences || baseReg.PreserveReferences;
-
-        // 4. ForPath ve ForCtorParam kurallarını birleştir (derived olanlar öncelikli)
-        var mergedForPath = new List<ForPathRule>(derivedReg.ForPathRules);
-        var derivedPaths = new HashSet<string>(derivedReg.ForPathRules.Select(r => string.Join(".", r.PathSegments)), StringComparer.OrdinalIgnoreCase);
-        foreach (var baseRule in baseReg.ForPathRules)
-        {
-            var basePathKey = string.Join(".", baseRule.PathSegments);
-            if (!derivedPaths.Contains(basePathKey))
+            foreach (var other in all)
             {
-                mergedForPath.Add(baseRule);
-            }
-        }
-
-        var mergedCtorParam = new List<CtorParamRule>(derivedReg.CtorParamRules);
-        var derivedParams = new HashSet<string>(derivedReg.CtorParamRules.Select(r => r.ParameterName), StringComparer.OrdinalIgnoreCase);
-        foreach (var baseRule in baseReg.CtorParamRules)
-        {
-            if (!derivedParams.Contains(baseRule.ParameterName))
-            {
-                mergedCtorParam.Add(baseRule);
-            }
-        }
-
-        return new MappingRegistration(
-            derivedReg.SourceType,
-            derivedReg.DestinationType,
-            mergedMemberRules,
-            customConverter,
-            derivedReg.ProfileName,
-            factory,
-            condition,
-            derivedReg.ForAllMembersIgnored || baseReg.ForAllMembersIgnored,
-            derivedReg.IsReverseMapRequested,
-            mergedBefore,
-            mergedAfter,
-            maxDepth,
-            preserveReferences,
-            derivedReg.IncludedDerivedTypes,
-            derivedReg.BaseTypeMapping,
-            mergedForPath,
-            mergedCtorParam);
-    }
-
-    /// <summary>
-    /// Tüm kayıtlı eşleştirmelerin (registration) bağımlılık grafiğini analiz ederek,
-    /// gereksiz yere context (ResolutionContext) kullanımını önleyecek şekilde RequiresContext bayraklarını optimize eder.
-    /// </summary>
-    private void OptimizeRequiresContext()
-    {
-        var visited = new Dictionary<(Type, Type), bool>();
-        var stack = new HashSet<(Type, Type)>();
-
-        foreach (var kvp in _registrations)
-        {
-            CheckRequiresContext(kvp.Key.Item1, kvp.Key.Item2, visited, stack);
-        }
-    }
-
-    /// <summary>
-    /// Belirtilen kaynak ve hedef türü çifti için mapping işleminin context gerektirip gerektirmediğini rekürsif ve dairesel referans korumalı olarak kontrol eder.
-    /// </summary>
-    private bool CheckRequiresContext(Type source, Type destination, Dictionary<(Type, Type), bool> visited, HashSet<(Type, Type)> stack)
-    {
-        var key = (source, destination);
-        if (visited.TryGetValue(key, out var cachedResult))
-        {
-            return cachedResult;
-        }
-
-        // Dairesel referans (döngü) tespiti
-        if (stack.Contains(key))
-        {
-            // Döngü oluştuğunda döngüyü kırmak için false dönüyoruz.
-            // Döngüdeki elemanlardan herhangi biri başka bir sebeple (örn. resolver, custom action) context gerektiriyorsa,
-            // o eleman kendi dalından zaten true dönecek ve bu bilgi tüm zincire yayılacaktır.
-            return false;
-        }
-
-        if (!_registrations.TryGetValue(key, out var reg))
-        {
-            return false;
-        }
-
-        // Eğer eşleştirme kendi kuralları gereği (before/after action vb.) doğrudan context gerektiriyorsa true'dur.
-        if (reg.SelfRequiresContext())
-        {
-            visited[key] = true;
-            reg.SetRequiresContext(true);
-            return true;
-        }
-
-        stack.Add(key);
-
-        bool childRequires = false;
-        var destProps = destination.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Where(p => p.CanWrite && ShouldMapProperty(p)).ToArray();
-        var sourceProps = source.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Where(ShouldMapProperty).ToArray();
-
-        foreach (var destProp in destProps)
-        {
-            // Global ignore edilenleri atla
-            if (_globalIgnores.Contains(destProp.Name))
-                continue;
-
-            // Ignore edilen property'leri atla
-            if (reg.MemberRules.TryGetValue(destProp.Name, out var rule) && rule.IsIgnored)
-                continue;
-
-            // Bu property için kaynak tipi belirle
-            Type? srcPropType = null;
-            if (rule != null && rule.MapFromExpression != null)
-            {
-                srcPropType = rule.MapFromExpression.ReturnType;
-            }
-            else
-            {
-                var srcProp = sourceProps.FirstOrDefault(s => Execution.NameMatchingHelper.IsMatch(s.Name, destProp.Name, this));
-                if (srcProp != null)
+                if (other == registration) continue;
+                if (registration.SourceType.IsAssignableFrom(other.SourceType) && registration.SourceType != other.SourceType &&
+                    registration.DestinationType.IsAssignableFrom(other.DestinationType) && registration.DestinationType != other.DestinationType)
                 {
-                    srcPropType = srcProp.PropertyType;
+                    registration.AddIncludedDerivedType(other.SourceType, other.DestinationType);
+                }
+            }
+        }
+    }
+
+    private void ResolveInheritance()
+    {
+        // Include ile bildirilen türetilmiş eşleştirmeler, IncludeBase belirtmemişse tabanı devralır
+        foreach (var registration in _registrations.Values.ToList())
+        {
+            foreach (var (derivedSource, derivedDestination) in registration.IncludedDerivedTypes)
+            {
+                if (_registrations.TryGetValue((derivedSource, derivedDestination), out var derived) && derived.BaseTypeMapping == null)
+                {
+                    derived.BaseTypeMapping = (registration.SourceType, registration.DestinationType);
                 }
             }
 
-            if (srcPropType == null)
-                continue;
-
-            var destPropType = destProp.PropertyType;
-
-            // Koleksiyon ise eleman tiplerini çözümle
-            if (Execution.CollectionExpressionHelper.IsCollectionType(srcPropType) &&
-                Execution.CollectionExpressionHelper.IsCollectionType(destPropType))
+            // IncludeBase ile tanımlanan türetilmiş eşleştirme, taban üzerinden polimorfik olarak da erişilebilir
+            if (registration.BaseTypeMapping is { } baseKey && _registrations.TryGetValue(baseKey, out var baseRegistration))
             {
-                var srcElem = Execution.CollectionExpressionHelper.GetCollectionElementType(srcPropType);
-                var dstElem = Execution.CollectionExpressionHelper.GetCollectionElementType(destPropType);
-                if (srcElem != null && dstElem != null)
-                {
-                    srcPropType = srcElem;
-                    destPropType = dstElem;
-                }
+                baseRegistration.AddIncludedDerivedType(registration.SourceType, registration.DestinationType);
+            }
+        }
+
+        var resolved = new HashSet<(Type, Type)>();
+        foreach (var key in _registrations.Keys.ToList()) Merge(key, resolved, new HashSet<(Type, Type)>());
+    }
+
+    private void Merge((Type, Type) key, HashSet<(Type, Type)> resolved, HashSet<(Type, Type)> visiting)
+    {
+        if (resolved.Contains(key) || !visiting.Add(key)) return;
+        if (!_registrations.TryGetValue(key, out var derived) || derived.BaseTypeMapping == null)
+        {
+            resolved.Add(key);
+            return;
+        }
+
+        var baseKey = (derived.BaseTypeMapping.Value.BaseSource, derived.BaseTypeMapping.Value.BaseDestination);
+        Merge(baseKey, resolved, visiting);
+
+        if (_registrations.TryGetValue(baseKey, out var baseRegistration))
+        {
+            foreach (var kvp in baseRegistration.MemberRules)
+            {
+                if (!derived.MutableMemberRules.ContainsKey(kvp.Key)) derived.MutableMemberRules[kvp.Key] = kvp.Value.Clone();
             }
 
-            // Karmaşık tip (primitive olmayan, string olmayan vb.) bağımlılığını kontrol et
-            if (!destPropType.IsPrimitive && destPropType != typeof(string) && destPropType != typeof(decimal) &&
-                destPropType != typeof(DateTime) && destPropType != typeof(Guid) && destPropType != typeof(TimeSpan) && !destPropType.IsEnum)
+            var derivedPaths = new HashSet<string>(derived.ForPathRules.Select(r => string.Join(".", r.PathSegments)));
+            derived.ForPathRules = derived.ForPathRules.Concat(baseRegistration.ForPathRules.Where(r => !derivedPaths.Contains(string.Join(".", r.PathSegments)))).ToList();
+
+            var derivedParameters = new HashSet<string>(derived.CtorParamRules.Select(r => r.ParameterName), StringComparer.OrdinalIgnoreCase);
+            derived.CtorParamRules = derived.CtorParamRules.Concat(baseRegistration.CtorParamRules.Where(r => !derivedParameters.Contains(r.ParameterName))).ToList();
+
+            derived.BeforeMapActions = baseRegistration.BeforeMapActions.Concat(derived.BeforeMapActions).ToList();
+            derived.AfterMapActions = baseRegistration.AfterMapActions.Concat(derived.AfterMapActions).ToList();
+            derived.ValueTransformers = baseRegistration.ValueTransformers.Concat(derived.ValueTransformers).ToList();
+            if (derived.MaxDepth == 0) derived.MaxDepth = baseRegistration.MaxDepth;
+            derived.PreserveReferences |= baseRegistration.PreserveReferences;
+            derived.IncludeMembers ??= baseRegistration.IncludeMembers;
+        }
+
+        resolved.Add(key);
+    }
+
+    private void EnablePreserveReferencesForCycles()
+    {
+        var registrations = _registrations.Values.Where(r => !IsOpenGeneric(r) && !r.HasTypeConverter && ExpressionBuilder.IsComplex(r.DestinationType)).ToList();
+        var edges = new Dictionary<(Type, Type), List<(Type, Type)>>();
+
+        foreach (var registration in registrations)
+        {
+            var profile = GetProfile(registration);
+            var targets = new List<(Type, Type)>();
+            foreach (var member in TypeMembers.GetDestinationMembers(registration.DestinationType, profile))
             {
-                if (CheckRequiresContext(srcPropType, destPropType, visited, stack))
+                var destinationType = ElementOrSelf(TypeMembers.GetMemberType(member));
+                Type? sourceType = null;
+                if (registration.MemberRules.TryGetValue(member.Name, out var rule) && rule.MapFromExpression != null) sourceType = rule.MapFromExpression.ReturnType;
+                else sourceType = ConventionResolver.FindDirect(registration.SourceType, member.Name, profile) is { } sourceMember ? TypeMembers.GetMemberType(sourceMember) : null;
+                if (sourceType == null) continue;
+
+                var key = (ElementOrSelf(sourceType), destinationType);
+                if (_registrations.ContainsKey(key)) targets.Add(key);
+            }
+
+            edges[(registration.SourceType, registration.DestinationType)] = targets;
+        }
+
+        // Bir kayıttan başlayıp kendisine geri dönen her yol döngüdür
+        foreach (var start in edges.Keys)
+        {
+            var stack = new Stack<(Type, Type)>(edges[start]);
+            var seen = new HashSet<(Type, Type)>();
+            while (stack.Count > 0)
+            {
+                var next = stack.Pop();
+                if (next == start)
                 {
-                    childRequires = true;
+                    var registration = _registrations[start];
+                    if (registration.MaxDepth == 0) registration.PreserveReferences = true;
                     break;
                 }
+
+                if (!seen.Add(next) || !edges.TryGetValue(next, out var children)) continue;
+                foreach (var child in children) stack.Push(child);
             }
         }
-
-        stack.Remove(key);
-
-        visited[key] = childRequires;
-        reg.SetRequiresContext(childRequires);
-        return childRequires;
     }
 
+    private static Type ElementOrSelf(Type type)
+        => CollectionExpressionHelper.IsCollectionType(type) ? CollectionExpressionHelper.GetCollectionElementType(type)! : Nullable.GetUnderlyingType(type) ?? type;
+
+    // ─── Kayıt arama ────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Belirtilen kaynak-hedef çifti için kayıtlı özel dönüştürücüyü döndürür.
-    /// Bulunamazsa null döner.
+    /// Tür çifti için kaydı bulur: tam eşleşme → open generic kapatma → kaynak türün tabanları (polimorfik kaynaklar).
     /// </summary>
-    internal object? GetCustomConverter(Type source, Type destination)
+    internal MappingRegistration? FindRegistration(Type sourceType, Type destinationType)
     {
-        return _converters.TryGetValue((source, destination), out var converter)
-            ? converter
-            : null;
+        sourceType = Mapper.GetUnproxiedType(sourceType);
+        return _lookupCache.GetOrAdd((sourceType, destinationType), key => new RegistrationLookup(Lookup(key.Item1, key.Item2))).Registration;
     }
 
-    /// <summary>
-    /// Belirtilen kaynak-hedef çifti için kayıtlı MappingRegistration'ı döndürür.
-    /// Bulunamazsa null döner.
-    /// </summary>
-    internal MappingRegistration? GetRegistration(Type source, Type destination)
+    private MappingRegistration? Lookup(Type sourceType, Type destinationType)
     {
-        source = Mapper.GetUnproxiedType(source);
-        destination = Mapper.GetUnproxiedType(destination);
-        if (_registrations.TryGetValue((source, destination), out var reg))
-            return reg;
+        if (_registrations.TryGetValue((sourceType, destinationType), out var exact)) return exact;
 
-        // Open Generics desteği: Eğer kaynak ve hedef tipler generic ise ve kapalıysa (closed generic)
-        if (source.IsGenericType && destination.IsGenericType && 
-            !source.IsGenericTypeDefinition && !destination.IsGenericTypeDefinition)
+        var closed = CloseOpenGeneric(sourceType, destinationType);
+        if (closed != null) return closed;
+
+        if (!ExpressionBuilder.IsComplex(sourceType) || !ExpressionBuilder.IsComplex(destinationType)) return null;
+
+        for (var baseType = sourceType.BaseType; baseType != null && baseType != typeof(object); baseType = baseType.BaseType)
         {
-            var openSource = source.GetGenericTypeDefinition();
-            var openDest = destination.GetGenericTypeDefinition();
+            if (_registrations.TryGetValue((baseType, destinationType), out var baseRegistration)) return baseRegistration;
+        }
 
-            if (_registrations.TryGetValue((openSource, openDest), out var openReg))
-            {
-                var key = (source, destination);
-                lock (_registrations)
-                {
-                    if (_registrations.TryGetValue(key, out var existing))
-                        return existing;
-
-                    var closedReg = CloseGenericRegistration(openReg, source, destination);
-                    _registrations[key] = closedReg;
-                    return closedReg;
-                }
-            }
+        foreach (var iface in sourceType.GetInterfaces())
+        {
+            if (_registrations.TryGetValue((iface, destinationType), out var interfaceRegistration)) return interfaceRegistration;
         }
 
         return null;
     }
 
-    /// <summary>
-    /// Open generic bir kaydı belirli kaynak ve hedef tipleriyle kapatıp yeni bir kayıt üretir.
-    /// </summary>
-    private MappingRegistration CloseGenericRegistration(MappingRegistration openReg, Type closedSource, Type closedDest)
+    private MappingRegistration? CloseOpenGeneric(Type sourceType, Type destinationType)
     {
-        return new MappingRegistration(
-            closedSource,
-            closedDest,
-            new Dictionary<string, MemberMappingRule>(openReg.MemberRules),
-            openReg.CustomConverter,
-            openReg.ProfileName + " [Closed Generic]",
-            openReg.FactoryDelegate,
-            openReg.ForAllMembersCondition,
-            openReg.ForAllMembersIgnored,
-            openReg.IsReverseMapRequested,
-            openReg.BeforeMapActions,
-            openReg.AfterMapActions,
-            openReg.MaxDepth,
-            openReg.PreserveReferences,
-            openReg.IncludedDerivedTypes,
-            openReg.BaseTypeMapping,
-            openReg.ForPathRules,
-            openReg.CtorParamRules,
-            openReg.IsIncludeAllDerivedRequested
-        );
+        if (_openGenericRegistrations.Count == 0) return null;
+
+        foreach (var open in _openGenericRegistrations)
+        {
+            var sourceMatches = open.SourceType.IsGenericTypeDefinition
+                ? sourceType.IsGenericType && sourceType.GetGenericTypeDefinition() == open.SourceType
+                : open.SourceType == sourceType;
+            var destinationMatches = open.DestinationType.IsGenericTypeDefinition
+                ? destinationType.IsGenericType && destinationType.GetGenericTypeDefinition() == open.DestinationType
+                : open.DestinationType == destinationType;
+            if (!sourceMatches || !destinationMatches) continue;
+
+            var closed = open.Clone(sourceType, destinationType);
+            closed.Profile = open.Profile;
+            foreach (var rule in closed.MemberRules.Values)
+            {
+                if (rule.SourceMemberPath != null)
+                {
+                    rule.MapFromExpression = MemberPath.BuildAccessor(sourceType, rule.SourceMemberPath);
+                    rule.SourceMemberPath = null;
+                }
+
+                if (rule.ValueConverterSourceMemberName != null)
+                {
+                    rule.ValueConverterSourceMember = MemberPath.BuildAccessor(sourceType, rule.ValueConverterSourceMemberName);
+                    rule.ValueConverterSourceMemberName = null;
+                }
+            }
+
+            if (open.OpenGenericForAllMembers != null || open.OpenGenericForAllOtherMembers != null)
+            {
+                var configured = new HashSet<string>(closed.MemberRules.Keys);
+                foreach (var member in DestinationMembers.GetWritable(destinationType))
+                {
+                    if (!closed.MutableMemberRules.TryGetValue(member.Name, out var rule))
+                    {
+                        rule = new MemberMappingRule(member.Name);
+                        closed.MutableMemberRules[member.Name] = rule;
+                    }
+
+                    if (!configured.Contains(member.Name))
+                    {
+                        foreach (var action in open.OpenGenericForAllOtherMembers ?? Array.Empty<Action<MemberConfigurationExpression>>())
+                            action(new MemberConfigurationExpression(rule, member));
+                    }
+
+                    foreach (var action in open.OpenGenericForAllMembers ?? Array.Empty<Action<MemberConfigurationExpression>>())
+                        action(new MemberConfigurationExpression(rule, member));
+                }
+            }
+
+            return _registrations.GetOrAdd((sourceType, destinationType), closed);
+        }
+
+        return null;
+    }
+
+    private sealed class RegistrationLookup
+    {
+        public RegistrationLookup(MappingRegistration? registration) => Registration = registration;
+        public MappingRegistration? Registration { get; }
+    }
+
+    // ─── Delege önbelleği ───────────────────────────────────────────────────
+
+    private const int TypedMap = 0;
+    private const int TypedPatch = 1;
+    private const int UntypedMap = 2;
+    private const int UntypedPatch = 3;
+
+    internal Func<TSource, VeloxResolutionContext, TDestination> GetMapDelegate<TSource, TDestination>()
+    {
+        // Tek slotluk statik önbellek: tipik uygulamada tek MapperConfiguration vardır; sözlük aramasını atlar.
+        var cached = TypedDelegateCache<TSource, TDestination>.Map;
+        if (cached != null && ReferenceEquals(cached.Owner, this)) return cached.Delegate;
+
+        var created = (Func<TSource, VeloxResolutionContext, TDestination>)GetDelegate(TypedMap, typeof(TSource), typeof(TDestination));
+        TypedDelegateCache<TSource, TDestination>.Map = new CacheEntry<Func<TSource, VeloxResolutionContext, TDestination>>(this, created);
+        return created;
+    }
+
+    internal Func<TSource, TDestination, VeloxResolutionContext, TDestination> GetPatchDelegate<TSource, TDestination>()
+    {
+        var cached = TypedDelegateCache<TSource, TDestination>.Patch;
+        if (cached != null && ReferenceEquals(cached.Owner, this)) return cached.Delegate;
+
+        var created = (Func<TSource, TDestination, VeloxResolutionContext, TDestination>)GetDelegate(TypedPatch, typeof(TSource), typeof(TDestination));
+        TypedDelegateCache<TSource, TDestination>.Patch = new CacheEntry<Func<TSource, TDestination, VeloxResolutionContext, TDestination>>(this, created);
+        return created;
+    }
+
+    private static class TypedDelegateCache<TSource, TDestination>
+    {
+        internal static CacheEntry<Func<TSource, VeloxResolutionContext, TDestination>>? Map;
+        internal static CacheEntry<Func<TSource, TDestination, VeloxResolutionContext, TDestination>>? Patch;
+    }
+
+    private sealed class CacheEntry<TDelegate>
+    {
+        public CacheEntry(MapperConfiguration owner, TDelegate @delegate)
+        {
+            Owner = owner;
+            Delegate = @delegate;
+        }
+
+        public MapperConfiguration Owner { get; }
+        public TDelegate Delegate { get; }
+    }
+
+    internal Func<object, VeloxResolutionContext, object> GetUntypedMapDelegate(Type sourceType, Type destinationType)
+        => (Func<object, VeloxResolutionContext, object>)GetDelegate(UntypedMap, sourceType, destinationType);
+
+    internal Func<object, object, VeloxResolutionContext, object> GetUntypedPatchDelegate(Type sourceType, Type destinationType)
+        => (Func<object, object, VeloxResolutionContext, object>)GetDelegate(UntypedPatch, sourceType, destinationType);
+
+    private Delegate GetDelegate(int kind, Type sourceType, Type destinationType)
+    {
+        var key = (sourceType, destinationType, kind);
+        if (_delegates.TryGetValue(key, out var cached)) return cached.Value;
+        return _delegates.GetOrAdd(key, k => new Lazy<Delegate>(() => Compile(k.Item3, k.Item1, k.Item2))).Value;
+    }
+
+    private Delegate Compile(int kind, Type sourceType, Type destinationType)
+    {
+        LambdaExpression lambda;
+        try
+        {
+            lambda = kind switch
+            {
+                TypedMap => ExpressionBuilder.BuildMapLambda(sourceType, destinationType, this),
+                TypedPatch => ExpressionBuilder.BuildPatchLambda(sourceType, destinationType, this),
+                UntypedMap => WrapUntypedMap(sourceType, destinationType),
+                _ => WrapUntypedPatch(sourceType, destinationType)
+            };
+        }
+        catch (VeloxException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new VeloxConfigurationException($"{sourceType.FullName} -> {destinationType.FullName} eşleştirme ifadesi üretilemedi: {ex.Message}", ex);
+        }
+
+        return lambda.Compile();
+    }
+
+    private LambdaExpression WrapUntypedMap(Type sourceType, Type destinationType)
+    {
+        var source = Expression.Parameter(typeof(object), "source");
+        var context = Expression.Parameter(typeof(VeloxResolutionContext), "context");
+        var typed = Expression.Constant(GetDelegate(TypedMap, sourceType, destinationType));
+        var call = Expression.Invoke(typed, Expression.Convert(source, sourceType), context);
+        return Expression.Lambda<Func<object, VeloxResolutionContext, object>>(Expression.Convert(call, typeof(object)), source, context);
+    }
+
+    private LambdaExpression WrapUntypedPatch(Type sourceType, Type destinationType)
+    {
+        var source = Expression.Parameter(typeof(object), "source");
+        var destination = Expression.Parameter(typeof(object), "destination");
+        var context = Expression.Parameter(typeof(VeloxResolutionContext), "context");
+        var typed = Expression.Constant(GetDelegate(TypedPatch, sourceType, destinationType));
+        var call = Expression.Invoke(typed, Expression.Convert(source, sourceType), Expression.Convert(destination, destinationType), context);
+        return Expression.Lambda<Func<object, object, VeloxResolutionContext, object>>(Expression.Convert(call, typeof(object)), source, destination, context);
     }
 
     /// <summary>
-    /// Tüm kayıtlı eşleştirmeleri döndürür (diagnostics için).
+    /// Source Generator (Layer 1) ile üretilmiş bir eşleştirme fonksiyonunu kaydeder; <c>Map&lt;TSource, TDestination&gt;</c>
+    /// çağrıları çalışma zamanı ifadesi yerine bu fonksiyonu kullanır.
     /// </summary>
-    internal IReadOnlyCollection<MappingRegistration> GetAllRegistrations()
+    /// <typeparam name="TSource">Kaynak tür.</typeparam>
+    /// <typeparam name="TDestination">Hedef tür.</typeparam>
+    /// <param name="mapFunc">Üretilmiş eşleştirme fonksiyonu.</param>
+    public void RegisterPrecompiledMapper<TSource, TDestination>(Func<TSource, TDestination> mapFunc)
     {
-        return (IReadOnlyCollection<MappingRegistration>)_registrations.Values;
+        if (mapFunc == null) throw new ArgumentNullException(nameof(mapFunc));
+        Func<TSource, VeloxResolutionContext, TDestination> wrapped = (source, _) => mapFunc(source);
+        _precompiledPairs[(typeof(TSource), typeof(TDestination))] = true;
+        _delegates[(typeof(TSource), typeof(TDestination), TypedMap)] = new Lazy<Delegate>(() => wrapped);
+        _delegates.TryRemove((typeof(TSource), typeof(TDestination), UntypedMap), out _);
+        if (ReferenceEquals(TypedDelegateCache<TSource, TDestination>.Map?.Owner, this)) TypedDelegateCache<TSource, TDestination>.Map = null;
+    }
+
+    // ─── ProjectTo ──────────────────────────────────────────────────────────
+
+    internal IQueryable Project(IQueryable source, Type destinationType, IDictionary<string, object>? parameters, IEnumerable<string>? membersToExpand)
+    {
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (destinationType == null) throw new ArgumentNullException(nameof(destinationType));
+
+        var sourceType = source.ElementType;
+        var expansions = (membersToExpand ?? Enumerable.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
+        var key = (sourceType, destinationType, string.Join("|", expansions));
+        var lambda = _projections.GetOrAdd(key, k => new Lazy<LambdaExpression>(() => ExpressionBuilder.BuildProjectionLambda(k.Item1, k.Item2, this, expansions))).Value;
+
+        if (parameters != null && parameters.Count > 0)
+        {
+            lambda = (LambdaExpression)new ParameterValueReplacer(parameters).Visit(lambda)!;
+        }
+
+        var call = Expression.Call(QueryableSelectMethod.MakeGenericMethod(sourceType, destinationType), source.Expression, Expression.Quote(lambda));
+        return source.Provider.CreateQuery(call);
     }
 
     /// <summary>
-    /// Tüm kayıtlı eşleştirmeleri derler ve ön-derlenmiş (precompiled) cache'e ekler (Pre-compilation).
+    /// ProjectTo ifadelerindeki kapanış (closure) değişkenlerini verilen parametre değerleriyle değiştirir.
     /// </summary>
+    /// <summary>ProjectTo parametre değerini taşıyan, EF Core tarafından SQL parametresine çevrilen sarmalayıcı.</summary>
+    private sealed class ParameterHolder<T>
+    {
+        public ParameterHolder(T value) => Value = value;
+
+        public T Value { get; }
+    }
+
+    private sealed class ParameterValueReplacer : ExpressionVisitor
+    {
+        private readonly IDictionary<string, object> _parameters;
+
+        public ParameterValueReplacer(IDictionary<string, object> parameters) => _parameters = parameters;
+
+        protected override Expression VisitMember(MemberExpression node)
+        {
+            if (node.Expression is ConstantExpression && _parameters.TryGetValue(node.Member.Name, out var value))
+            {
+                var type = node.Type;
+                if (value != null && !type.IsInstanceOfType(value)) value = System.Convert.ChangeType(value, Nullable.GetUnderlyingType(type) ?? type, System.Globalization.CultureInfo.InvariantCulture);
+                // Sabit yerine sarmalayıcı üye erişimi: EF Core bunu SQL parametresine çevirir (sorgu planı önbelleği korunur)
+                var holder = Activator.CreateInstance(typeof(ParameterHolder<>).MakeGenericType(type), value)!;
+                return Expression.Property(Expression.Constant(holder), "Value");
+            }
+
+            return base.VisitMember(node);
+        }
+    }
+
+    // ─── IConfigurationProvider ─────────────────────────────────────────────
+
+    /// <summary>Bu yapılandırmadan yeni bir mapper oluşturur.</summary>
+    /// <returns>Yeni mapper.</returns>
+    public IVeloxMapper CreateMapper() => new Mapper(this);
+
+    /// <summary>Resolver/converter örneklerini verilen fabrika ile oluşturan yeni bir mapper oluşturur.</summary>
+    /// <param name="serviceCtor">Tip alıp örnek döndüren fabrika.</param>
+    /// <returns>Yeni mapper.</returns>
+    public IVeloxMapper CreateMapper(Func<Type, object> serviceCtor) => new Mapper(this, serviceCtor);
+
+    IMapper IConfigurationProvider.CreateMapper() => CreateMapper();
+
+    IMapper IConfigurationProvider.CreateMapper(Func<Type, object> serviceCtor) => CreateMapper(serviceCtor);
+
+    /// <inheritdoc />
+    public LambdaExpression BuildExecutionPlan(Type sourceType, Type destinationType)
+    {
+        if (sourceType == null) throw new ArgumentNullException(nameof(sourceType));
+        if (destinationType == null) throw new ArgumentNullException(nameof(destinationType));
+        return ExpressionBuilder.BuildMapLambda(sourceType, destinationType, this);
+    }
+
+    /// <inheritdoc />
     public void CompileMappings()
     {
-        foreach (var reg in _registrations.Values)
+        foreach (var registration in GetAllRegistrations().ToList())
         {
-            if (reg.SourceType.IsGenericTypeDefinition || reg.DestinationType.IsGenericTypeDefinition || reg.CustomConverter != null)
-                continue;
-
-            var key = (reg.SourceType, reg.DestinationType);
-            if (!_precompiledMappers.ContainsKey(key))
-            {
-                var stronglyTypedDelegate = Execution.ExpressionBuilder.BuildStronglyTypedMapDelegate(reg.SourceType, reg.DestinationType, this);
-                _precompiledMappers[key] = stronglyTypedDelegate;
-            }
+            if (registration.SourceType.ContainsGenericParameters || registration.DestinationType.ContainsGenericParameters) continue;
+            if (registration.DestinationType.IsAbstract && registration.RedirectDestinationType == null && !registration.HasTypeConverter && registration.FactoryDelegate == null && registration.FactoryDelegateWithContext == null) continue;
+            GetDelegate(TypedMap, registration.SourceType, registration.DestinationType);
         }
     }
 
-    /// <summary>
-    /// Flattening ile eşleşme mümkün mü kontrol eder.
-    /// Örn: "AddressCity" → source.Address.City
-    /// </summary>
-    private bool CanFlatten(Type sourceType, string destPropertyName)
+    /// <inheritdoc />
+    public void AssertConfigurationIsValid() => ThrowIfInvalid(_ => true, null);
+
+    /// <inheritdoc />
+    public void AssertConfigurationIsValid<TProfile>() where TProfile : VeloxProfile
     {
-        // Hedef property adı için tüm temizlenmiş aday isimleri çıkar
-        var candidates = Execution.NameMatchingHelper.GetNameCandidates(destPropertyName, DestinationPrefixes, Postfixes, NamingConvention);
-        foreach (var candidate in candidates)
+        string name;
+        try
         {
-            if (TryResolveFlattening(sourceType, candidate, 0))
-                return true;
+            name = ((VeloxProfile)Activator.CreateInstance(typeof(TProfile), nonPublic: true)!).ProfileName;
         }
-        return false;
+        catch (MissingMethodException)
+        {
+            name = typeof(TProfile).FullName!;
+        }
+
+        AssertConfigurationIsValid(name);
+    }
+
+    /// <inheritdoc />
+    public void AssertConfigurationIsValid(string profileName)
+    {
+        if (profileName == null) throw new ArgumentNullException(nameof(profileName));
+        ThrowIfInvalid(r => r.ProfileName == profileName, profileName);
+    }
+
+    private void ThrowIfInvalid(Func<MappingRegistration, bool> filter, string? profileName)
+    {
+        var report = new ConfigurationValidator(this).Validate(GetAllRegistrations().Where(filter).ToList());
+        if (report.Count == 0) return;
+
+        var builder = new StringBuilder();
+        builder.AppendLine(profileName == null
+            ? "VeloxMapper yapılandırma doğrulaması başarısız. Aşağıdaki eşleştirmeleri gözden geçirin:"
+            : $"VeloxMapper yapılandırma doğrulaması başarısız ('{profileName}' profili). Aşağıdaki eşleştirmeleri gözden geçirin:");
+        builder.AppendLine();
+        var index = 1;
+        foreach (var error in report)
+        {
+            builder.Append("  ").Append(index++).Append(". ").AppendLine(error);
+        }
+
+        builder.AppendLine();
+        builder.Append("Çözüm: eksik üyeler için ForMember(d => d.Uye, o => o.MapFrom(...)) veya o.Ignore() kullanın; ")
+               .Append("kaynak doğrulaması için ForSourceMember(...).DoNotValidate(), doğrulamayı kapatmak için ValidateMemberList(MemberList.None).");
+        throw new VeloxValidationException(builder.ToString());
+    }
+
+    // ─── Teşhis ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Bir tür çifti için üye bazında eşleştirme planını (hangi hedef üyenin nereden geldiğini) döndürür.
+    /// CI'da snapshot testi için <see cref="MappingPlanReport"/> ile birlikte kullanılabilir.
+    /// </summary>
+    /// <param name="source">Kaynak tür.</param>
+    /// <param name="destination">Hedef tür.</param>
+    /// <param name="mode">Eşleştirme modu.</param>
+    public MappingPlanDef GetMappingPlan(Type source, Type destination, MappingMode mode = MappingMode.Map)
+    {
+        if (source == null) throw new ArgumentNullException(nameof(source));
+        if (destination == null) throw new ArgumentNullException(nameof(destination));
+
+        var registration = FindRegistration(source, destination);
+        var profile = GetProfile(registration);
+        var parameter = Expression.Parameter(source, "src");
+        var properties = new List<MappedPropertyDesc>();
+
+        foreach (var member in TypeMembers.GetDestinationMembers(destination, profile).OrderBy(m => m.Name, StringComparer.Ordinal))
+        {
+            var description = new MappedPropertyDesc { TargetProperty = member.Name };
+            MemberMappingRule? rule = null;
+            registration?.MemberRules.TryGetValue(member.Name, out rule);
+            var pathRule = registration?.ForPathRules.FirstOrDefault(p => p.PathSegments[0] == member.Name);
+
+            if (rule?.IsIgnored == true || (rule == null && profile.IsGloballyIgnored(member.Name)))
+            {
+                description.SourceProperty = "Ignored";
+                description.ExecutionType = "Ignored";
+            }
+            else if (rule != null && rule.HasValueSource)
+            {
+                description.SourceProperty = rule.MapFromExpression?.ToString()
+                    ?? rule.ResolverType?.Name ?? rule.ResolverInstance?.GetType().Name
+                    ?? rule.MemberValueResolverType?.Name ?? rule.ValueConverterType?.Name ?? rule.ValueConverter?.GetType().Name
+                    ?? "Custom";
+                description.ExecutionType = "Complex";
+            }
+            else if (pathRule != null)
+            {
+                description.SourceProperty = pathRule.MemberRule.MapFromExpression?.ToString() ?? string.Join(".", pathRule.PathSegments);
+                description.ExecutionType = "Complex";
+            }
+            else if (ConventionResolver.FindDirect(source, member.Name, profile) is { } direct)
+            {
+                description.SourceProperty = direct.Name;
+                description.ExecutionType = "Assigned";
+            }
+            else if (ConventionResolver.ResolveFlattening(parameter, member.Name, profile) != null)
+            {
+                description.SourceProperty = member.Name;
+                description.ExecutionType = "Flattened";
+            }
+            else if (ConventionResolver.Resolve(parameter, member.Name, profile, registration, this) != null)
+            {
+                description.SourceProperty = member.Name;
+                description.ExecutionType = "IncludedMember";
+            }
+            else
+            {
+                description.SourceProperty = "None";
+                description.ExecutionType = "Unmapped";
+            }
+
+            properties.Add(description);
+        }
+
+        return new MappingPlanDef
+        {
+            SourceType = source.FullName ?? source.Name,
+            DestinationType = destination.FullName ?? destination.Name,
+            ProfileName = registration?.ProfileName ?? string.Empty,
+            Mode = mode,
+            Properties = properties.ToArray()
+        };
     }
 
     /// <summary>
-    /// Rekürsif flattening çözümleme — property adı parçalarını kaynak tipte arar.
+    /// <see cref="ILogger"/> üzerine yazan teşhis hedefi.
     /// </summary>
-    private bool TryResolveFlattening(Type type, string remaining, int depth)
+    private sealed class LoggerDiagnosticsSink : IVeloxDiagnosticsSink
     {
-        // Sonsuz döngü koruması
-        if (depth > 10 || string.IsNullOrEmpty(remaining)) return false;
+        private readonly ILogger _logger;
 
-        var props = type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Where(ShouldMapProperty).ToArray();
+        public LoggerDiagnosticsSink(ILogger logger) => _logger = logger;
 
-        // Greedy left-to-right matching (AutoMapper algoritması)
-        for (int i = 1; i <= remaining.Length; i++)
+        public void Log(string message, string severity = "Information", string? sourceFile = null, int? lineNumber = null)
         {
-            var candidate = remaining.Substring(0, i);
-            var matchProp = props.FirstOrDefault(p =>
-                Execution.NameMatchingHelper.IsMatch(p.Name, candidate, this));
-
-            if (matchProp != null)
+            var level = severity switch
             {
-                var rest = remaining.Substring(i);
-
-                // Kalan string boşsa — tam eşleşme
-                if (rest.Length == 0) return true;
-
-                // Alt property'de devam et
-                if (TryResolveFlattening(matchProp.PropertyType, rest, depth + 1))
-                    return true;
-            }
+                "Debug" => LogLevel.Debug,
+                "Warning" => LogLevel.Warning,
+                "Error" => LogLevel.Error,
+                _ => LogLevel.Information
+            };
+            _logger.Log(level, "{Message}", message);
         }
-
-        return false;
-    }
-
-    /// <summary>
-    /// İki tür arasında implicit uyumluluk kontrolü yapar.
-    /// Enum, Nullable, koleksiyonlar ve kayıtlı özel haritaları dikkate alır.
-    /// </summary>
-    private bool IsCompatibleType(Type source, Type destination)
-    {
-        // Doğrudan atanabilir
-        if (destination.IsAssignableFrom(source)) return true;
-
-        // Kayıtlı bir eşleştirme var mı?
-        if (_registrations.ContainsKey((source, destination))) return true;
-
-        // Kayıtlı özel bir dönüştürücü var mı? (Reviewer bulgusu: DI veya inline olarak eklenen converter'lar)
-        if (_converters.ContainsKey((source, destination))) return true;
-
-        // Nullable unwrap
-        var srcUnderlying = Nullable.GetUnderlyingType(source) ?? source;
-        var dstUnderlying = Nullable.GetUnderlyingType(destination) ?? destination;
-
-        // Aynı tür (nullable unwrap sonrası)
-        if (srcUnderlying == dstUnderlying) return true;
-
-        // Kayıtlı eşleştirme (underlying tipler arasında)
-        if (_registrations.ContainsKey((srcUnderlying, dstUnderlying))) return true;
-
-        // Kayıtlı özel dönüştürücü (underlying tipler arasında)
-        if (_converters.ContainsKey((srcUnderlying, dstUnderlying))) return true;
-
-        // Enum → Enum (farklı enum türleri)
-        if (srcUnderlying.IsEnum && dstUnderlying.IsEnum) return true;
-
-        // Enum → string veya string → Enum
-        if ((srcUnderlying.IsEnum && dstUnderlying == typeof(string)) ||
-            (srcUnderlying == typeof(string) && dstUnderlying.IsEnum))
-            return true;
-
-        // Enum → int / int → Enum (underlying type)
-        if ((srcUnderlying.IsEnum && dstUnderlying == Enum.GetUnderlyingType(srcUnderlying)) ||
-            (dstUnderlying.IsEnum && srcUnderlying == Enum.GetUnderlyingType(dstUnderlying)))
-            return true;
-
-        // Koleksiyon tipleri arası dönüşüm kontrolü
-        if (Execution.CollectionExpressionHelper.IsCollectionType(source) &&
-            Execution.CollectionExpressionHelper.IsCollectionType(destination))
-        {
-            var srcElement = Execution.CollectionExpressionHelper.GetCollectionElementType(source);
-            var dstElement = Execution.CollectionExpressionHelper.GetCollectionElementType(destination);
-            if (srcElement != null && dstElement != null)
-            {
-                return IsCompatibleType(srcElement, dstElement);
-            }
-        }
-
-        return false;
     }
 }

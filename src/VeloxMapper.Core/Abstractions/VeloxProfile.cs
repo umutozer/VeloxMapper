@@ -1,110 +1,229 @@
 using System;
-using System.Collections.Generic;
+using System.Reflection;
+using VeloxMapper.Abstractions;
 using VeloxMapper.Configuration;
 
 namespace VeloxMapper;
 
 /// <summary>
-/// Eşleştirme yapılandırmalarını gruplandırmak için kullanılan profil taban sınıfı.
-/// AutoMapper'ın <c>Profile</c> sınıfının VeloxMapper karşılığıdır.
-/// <para>
-/// Kullanım:
+/// Eşleştirme tanımlarını ve profil düzeyindeki konvansiyonları gruplayan taban sınıf.
+/// Yeni kodda AutoMapper ile aynı isme sahip <see cref="Profile"/> sınıfından türetin; <see cref="VeloxProfile"/>
+/// 5.x sürümleriyle geriye dönük uyumluluk için korunur.
+/// </summary>
+/// <example>
 /// <code>
-/// public class UserProfile : VeloxProfile
+/// public class OrderProfile : Profile
 /// {
-///     public UserProfile()
+///     public OrderProfile()
 ///     {
-///         CreateMap&lt;User, UserDto&gt;();
 ///         CreateMap&lt;Order, OrderDto&gt;()
-///             .ForMember(d =&gt; d.Total, opt =&gt; opt.MapFrom(s =&gt; s.Amount));
+///             .ForMember(d =&gt; d.CustomerName, o =&gt; o.MapFrom(s =&gt; s.Customer.Name));
 ///     }
 /// }
 /// </code>
-/// </para>
-/// </summary>
-public abstract class VeloxProfile
+/// </example>
+public abstract class VeloxProfile : IProfileExpression
 {
-    // MappingExpression örneklerini generic-agnostic tutan liste.
-    // Her CreateMap çağrısı buraya Build fonksiyonunu kaydeder.
-    private readonly List<Func<string?, MappingRegistration>> _registrationFactories = new();
+    private readonly string? _profileName;
 
-    /// <summary>
-    /// Profil düzeyinde tanımlanmış value transformer koleksiyonu.
-    /// </summary>
-    protected ValueTransformerCollection ValueTransformers { get; } = new();
-
-    /// <summary>
-    /// Dahili kullanım için ValueTransformers koleksiyonunu dışa açar.
-    /// </summary>
-    internal ValueTransformerCollection ProfileValueTransformers => ValueTransformers;
-
-    /// <summary>
-    /// Kaynak ve hedef tür çifti için yeni bir eşleştirme kaydı oluşturur.
-    /// Dönen <see cref="IMappingExpression{TSource,TDestination}"/> üzerinden
-    /// ForMember, Ignore ve ConvertUsing yapılandırmaları zincirlenebilir.
-    /// </summary>
-    /// <typeparam name="TSource">Kaynak tür</typeparam>
-    /// <typeparam name="TDestination">Hedef tür</typeparam>
-    /// <returns>Fluent yapılandırma arayüzü</returns>
-    protected IMappingExpression<TSource, TDestination> CreateMap<TSource, TDestination>()
+    /// <summary>Profili tür adıyla oluşturur.</summary>
+    protected VeloxProfile()
     {
-        var expression = new MappingExpression<TSource, TDestination>();
-
-        _registrationFactories.Add(profileName => expression.Build(profileName));
-        return expression;
+        Configuration = new ProfileConfiguration(null);
     }
 
-    /// <summary>
-    /// Tip nesneleri ile eşleştirme tanımlar. Özellikle Open Generic eşleştirmeleri için kullanılır.
-    /// </summary>
-    /// <param name="sourceType">Kaynak türü</param>
-    /// <param name="destinationType">Hedef türü</param>
-    /// <returns>Fluent yapılandırma arayüzü</returns>
-    protected IMappingExpression CreateMap(Type sourceType, Type destinationType)
+    /// <summary>Profili verilen adla oluşturur.</summary>
+    /// <param name="profileName">Profil adı.</param>
+    protected VeloxProfile(string profileName) : this()
     {
-        if (sourceType is null)
-        {
-            throw new ArgumentNullException(nameof(sourceType)); // Kaynak tür null olamaz.
-        }
-        if (destinationType is null)
-        {
-            throw new ArgumentNullException(nameof(destinationType)); // Hedef tür null olamaz.
-        }
-
-        // Açık generic (Open Generic) tipler için özel expression oluşturulur
-        if (sourceType.IsGenericTypeDefinition || destinationType.IsGenericTypeDefinition)
-        {
-            var openExpr = new OpenGenericMappingExpression(sourceType, destinationType);
-            _registrationFactories.Add(profileName => openExpr.Build(profileName));
-            return openExpr;
-        }
-
-        var expressionType = typeof(MappingExpression<,>).MakeGenericType(sourceType, destinationType);
-        var expression = (IMappingExpression)Activator.CreateInstance(expressionType)!;
-
-        _registrationFactories.Add(profileName => {
-            var buildMethod = expressionType.GetMethod("Build", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-            return (MappingRegistration)buildMethod.Invoke(expression, [profileName])!;
-        });
-
-        return expression;
+        _profileName = profileName;
     }
 
-    /// <summary>
-    /// Profil içindeki tüm CreateMap çağrılarını işleyerek
-    /// dondurulmuş <see cref="MappingRegistration"/> listesi üretir.
-    /// MapperConfiguration tarafından çağrılır.
-    /// </summary>
-    internal List<MappingRegistration> BuildRegistrations()
+    /// <summary>Profili verilen adla oluşturur ve yapılandırma eylemini uygular.</summary>
+    /// <param name="profileName">Profil adı.</param>
+    /// <param name="configurationAction">Profil yapılandırması.</param>
+    protected VeloxProfile(string profileName, Action<IProfileExpression> configurationAction) : this(profileName)
     {
-        var profileName = GetType().Name;
-        var registrations = new List<MappingRegistration>(_registrationFactories.Count);
+        if (configurationAction == null) throw new ArgumentNullException(nameof(configurationAction));
+        configurationAction(this);
+    }
 
-        foreach (var factory in _registrationFactories)
-        {
-            registrations.Add(factory(profileName));
-        }
+    /// <summary>İç depo.</summary>
+    internal ProfileConfiguration Configuration { get; }
 
-        return registrations;
+    /// <inheritdoc />
+    public virtual string ProfileName => _profileName ?? GetType().FullName ?? GetType().Name;
+
+    // ─── Eşleştirme tanımları ───────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public IMappingExpression<TSource, TDestination> CreateMap<TSource, TDestination>()
+        => Configuration.CreateMap<TSource, TDestination>(MemberList.Destination);
+
+    /// <inheritdoc />
+    public IMappingExpression<TSource, TDestination> CreateMap<TSource, TDestination>(MemberList memberList)
+        => Configuration.CreateMap<TSource, TDestination>(memberList);
+
+    /// <inheritdoc />
+    public IMappingExpression CreateMap(Type sourceType, Type destinationType)
+        => Configuration.CreateMap(sourceType, destinationType, MemberList.Destination);
+
+    /// <inheritdoc />
+    public IMappingExpression CreateMap(Type sourceType, Type destinationType, MemberList memberList)
+        => Configuration.CreateMap(sourceType, destinationType, memberList);
+
+    /// <inheritdoc />
+    public IMappingExpression<TSource, TDestination> CreateProjection<TSource, TDestination>()
+        => Configuration.CreateMap<TSource, TDestination>(MemberList.Destination);
+
+    /// <inheritdoc />
+    public IMappingExpression<TSource, TDestination> CreateProjection<TSource, TDestination>(MemberList memberList)
+        => Configuration.CreateMap<TSource, TDestination>(memberList);
+
+    // ─── Konvansiyonlar ─────────────────────────────────────────────────────
+
+    /// <inheritdoc />
+    public void ClearPrefixes()
+    {
+        Configuration.Prefixes.Clear();
+        Configuration.PrefixesCleared = true;
+    }
+
+    /// <inheritdoc />
+    public void RecognizePrefixes(params string[] prefixes) => Configuration.AddPrefixes(Configuration.Prefixes, prefixes);
+
+    /// <inheritdoc />
+    public void RecognizePostfixes(params string[] postfixes) => Configuration.AddPrefixes(Configuration.Postfixes, postfixes);
+
+    /// <inheritdoc />
+    public void RecognizeDestinationPrefixes(params string[] prefixes) => Configuration.AddPrefixes(Configuration.DestinationPrefixes, prefixes);
+
+    /// <inheritdoc />
+    public void RecognizeDestinationPostfixes(params string[] postfixes) => Configuration.AddPrefixes(Configuration.DestinationPostfixes, postfixes);
+
+    /// <inheritdoc />
+    public void ReplaceMemberName(string original, string newValue)
+    {
+        if (string.IsNullOrEmpty(original)) throw new ArgumentNullException(nameof(original));
+        Configuration.MemberNameReplacers.Add(new(original, newValue ?? string.Empty));
+    }
+
+    /// <inheritdoc />
+    public void AddGlobalIgnore(string propertyNameStartingWith)
+    {
+        if (!string.IsNullOrWhiteSpace(propertyNameStartingWith)) Configuration.GlobalIgnores.Add(propertyNameStartingWith);
+    }
+
+    /// <inheritdoc />
+    public bool? AllowNullDestinationValues
+    {
+        get => Configuration.AllowNullDestinationValues;
+        set => Configuration.AllowNullDestinationValues = value;
+    }
+
+    /// <inheritdoc />
+    public bool? AllowNullCollections
+    {
+        get => Configuration.AllowNullCollections;
+        set => Configuration.AllowNullCollections = value;
+    }
+
+    /// <inheritdoc />
+    public bool? EnableNullPropagationForQueryMapping
+    {
+        get => Configuration.EnableNullPropagationForQueryMapping;
+        set => Configuration.EnableNullPropagationForQueryMapping = value;
+    }
+
+    /// <inheritdoc />
+    public ICustomNamingConvention? SourceMemberNamingConvention
+    {
+        get => Configuration.SourceMemberNamingConvention;
+        set => Configuration.SourceMemberNamingConvention = value;
+    }
+
+    /// <inheritdoc />
+    public ICustomNamingConvention? DestinationMemberNamingConvention
+    {
+        get => Configuration.DestinationMemberNamingConvention;
+        set => Configuration.DestinationMemberNamingConvention = value;
+    }
+
+    /// <inheritdoc />
+    public Func<PropertyInfo, bool>? ShouldMapProperty
+    {
+        get => Configuration.ShouldMapProperty;
+        set => Configuration.ShouldMapProperty = value;
+    }
+
+    /// <inheritdoc />
+    public Func<FieldInfo, bool>? ShouldMapField
+    {
+        get => Configuration.ShouldMapField;
+        set => Configuration.ShouldMapField = value;
+    }
+
+    /// <inheritdoc />
+    public Func<MethodInfo, bool>? ShouldMapMethod
+    {
+        get => Configuration.ShouldMapMethod;
+        set => Configuration.ShouldMapMethod = value;
+    }
+
+    /// <inheritdoc />
+    public Func<ConstructorInfo, bool>? ShouldUseConstructor
+    {
+        get => Configuration.ShouldUseConstructor;
+        set => Configuration.ShouldUseConstructor = value;
+    }
+
+    /// <inheritdoc />
+    public void DisableConstructorMapping() => Configuration.ConstructorMappingDisabled = true;
+
+    /// <inheritdoc />
+    public void IncludeSourceExtensionMethods(Type type)
+    {
+        if (type == null) throw new ArgumentNullException(nameof(type));
+        if (!Configuration.SourceExtensionMethodTypes.Contains(type)) Configuration.SourceExtensionMethodTypes.Add(type);
+    }
+
+    /// <inheritdoc />
+    public ValueTransformerCollection ValueTransformers => Configuration.ValueTransformers;
+
+    /// <inheritdoc />
+    public void ForAllMaps(Action<TypeMap, IMappingExpression> configuration)
+        => Configuration.ForAllMapsActions.Add(configuration ?? throw new ArgumentNullException(nameof(configuration)));
+
+    /// <inheritdoc />
+    public void ForAllPropertyMaps(Func<PropertyMap, bool> condition, Action<PropertyMap, IMemberConfigurationExpression> memberOptions)
+    {
+        if (condition == null) throw new ArgumentNullException(nameof(condition));
+        if (memberOptions == null) throw new ArgumentNullException(nameof(memberOptions));
+        Configuration.ForAllPropertyMapsActions.Add(new(condition, memberOptions));
+    }
+}
+
+/// <summary>
+/// Eşleştirme tanımlarını gruplayan profil taban sınıfı. AutoMapper'ın <c>Profile</c> sınıfı ile aynı isim ve üyelere sahiptir;
+/// mevcut AutoMapper profilleri yalnızca <c>using</c> satırı değiştirilerek derlenir.
+/// </summary>
+public abstract class Profile : VeloxProfile
+{
+    /// <summary>Profili tür adıyla oluşturur.</summary>
+    protected Profile()
+    {
+    }
+
+    /// <summary>Profili verilen adla oluşturur.</summary>
+    /// <param name="profileName">Profil adı.</param>
+    protected Profile(string profileName) : base(profileName)
+    {
+    }
+
+    /// <summary>Profili verilen adla oluşturur ve yapılandırma eylemini uygular.</summary>
+    /// <param name="profileName">Profil adı.</param>
+    /// <param name="configurationAction">Profil yapılandırması.</param>
+    protected Profile(string profileName, Action<IProfileExpression> configurationAction) : base(profileName, configurationAction)
+    {
     }
 }

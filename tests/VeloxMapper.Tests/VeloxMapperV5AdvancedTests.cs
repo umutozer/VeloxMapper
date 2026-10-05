@@ -455,7 +455,7 @@ public class TestTransformerProfile : VeloxProfile
 {
     public TestTransformerProfile()
     {
-        ProfileValueTransformers.Add<int>(val => val * 2);
+        ValueTransformers.Add<int>(val => val * 2);
         CreateMap<TransformerSrc, TransformerDest>();
     }
 }

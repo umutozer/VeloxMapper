@@ -4,7 +4,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Xunit;
 using VeloxMapper.Abstractions;
 using VeloxMapper.Configuration;
-using VeloxMapper.DependencyInjection;
 
 namespace VeloxMapper.Tests;
 

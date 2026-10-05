@@ -1,6 +1,62 @@
-# VeloxMapper Değişiklik Günlüğü (CHANGELOG)
+# VeloxMapper Değişiklik Günlüğü
 
-Tüm sürüm değişiklikleri bu dosyada kayıt altında tutulur. VeloxMapper projesinin temel amacı, .NET projelerinde en az efor ve zahmet ile geliştiricilerin AutoMapper'dan VeloxMapper'a geçmesini sağlamak ve kusursuz bir eşleştirme (mapping) deneyimi sunmaktır.
+Tüm önemli değişiklikler bu dosyada tutulur. Sürümleme [SemVer](https://semver.org/lang/tr/) kurallarına uyar.
+Ayrıntılı sürüm notları: https://veloxmapper-website.netlify.app/docs/changelog
+
+---
+
+## [6.0.0] - 2026-10-05
+
+Bu sürümün hedefi, AutoMapper kullanan projelerin **kod değiştirmeden** VeloxMapper'a geçebilmesidir: tür, metot ve
+overload adları AutoMapper ile eşitlendi; davranışlar AutoMapper parite testleriyle doğrulandı.
+
+### Eklenenler
+- AutoMapper ile aynı adlı tür ve arayüzler: `IMapper`, `Profile`, `ResolutionContext`, `IMappingOperationOptions`,
+  `IValueResolver`, `IMemberValueResolver`, `IValueConverter`, `ITypeConverter`, `IMappingAction`, `IProfileExpression`,
+  `IMapperConfigurationExpression`, `MapperConfigurationExpression`, `TypeMap`, `PropertyMap`, non-generic `IMappingExpression`
+  ve `IMemberConfigurationExpression`.
+- `IMapper` üzerinde tüm AutoMapper overload'ları: `Map(object, Type, Type)`, `Map(object, object, Type, Type)`, işlem seçenekli
+  (`opts => opts.Items[...]`, `BeforeMap`, `AfterMap`, `State`, `ConstructServicesUsing`) overload'lar, `ProjectTo` overload'ları.
+- `VeloxMapper.QueryableExtensions.Extensions.ProjectTo<T>(IConfigurationProvider, ...)` (parametreler ve `ExplicitExpansion` dahil).
+- DI: `AddVeloxMapper` için AutoMapper'ın tüm overload'ları (assembly, marker type, `(sp, cfg)` delegesi) ve `AddAutoMapper` takma adı.
+  Birden çok çağrı tek yapılandırmada birleşir; taranan assembly'lerdeki resolver/converter/action türleri otomatik kaydedilir.
+- `MapFrom` ile farklı türde kaynak (`s => s.Customer` → `CustomerDto`, koleksiyonlar), resolver/converter örnek overload'ları,
+  ad tabanlı (`"Sub.Code"`) kaynaklar, `PreCondition(ctx)`, `AddTransform`, `DestinationMember`.
+- `ReverseMap()` ters ifadeyi döndürür ve zincirlenebilir; `MapFrom` üye zincirleri ve flattening otomatik tersine çevrilir.
+- Profil düzeyinde konvansiyonlar (isimlendirme kuralları, ön/son ekler, `AllowNullCollections`, `ShouldMapProperty`...),
+  `ReplaceMemberName`, `IncludeSourceExtensionMethods`, `DisableConstructorMapping`, `ShouldUseConstructor`, `ForAllMaps((typeMap, map) => ...)`,
+  `ForAllPropertyMaps`, `CreateProfile`.
+- Kaynak `GetX()` metotlarının `X` üyesine eşlenmesi, public field eşleme, yerleşik tür dönüşümleri (ToString, Parse, System.Convert,
+  kullanıcı tanımlı operatörler), isimle enum eşleme, `IReadOnlyDictionary`/`ObservableCollection`/setter'sız koleksiyon desteği.
+- `[AutoMap]` ile `[Ignore]`, `[SourceMember]`, `[NullSubstitute]`, `[ValueResolver]`, `[ValueConverter]`, `[UseExistingValue]`,
+  `[MappingOrder]` üye öznitelikleri.
+- `AssertConfigurationIsValid<TProfile>()`, `AssertConfigurationIsValid(string)`, `MemberList.Source` doğrulaması, kurucu doğrulaması,
+  `CreateMapper(Func<Type, object>)`, `BuildExecutionPlan`, `MapperConfiguration(cfg, ILoggerFactory)`, `cfg.LicenseKey` (yok sayılır).
+- `tools/migrate-from-automapper.ps1` geçiş betiği.
+
+### Değişenler (kırıcı)
+- `Map(source, destination)` hedefi döndürür; iç nesneler ve koleksiyonlar mevcut örneklerine eşlenir.
+- `Action<VeloxResolutionContext>` alan overload'lar yerine `IMappingOperationOptions` (lambda'lar aynen derlenir).
+- `ForAllMembers` parametresi `IMemberConfigurationExpression<TSource, TDestination, object>`; tek parametreli `ConvertUsing` artık
+  `Expression<Func<TSource, TDestination>>` alır; `ValueTransformers.Add<T>` ifade alır.
+- `DoNotValidate` üyeyi yok saymaz, yalnızca doğrulamadan muaf tutar; `DisableCtorValidation` yalnızca kurucu doğrulamasını kapatır;
+  `Ignore` kuralları `ReverseMap` ile tersine çevrilmez (AutoMapper davranışı).
+- `MapperConfiguration`, `VeloxMapperOptions`, `AutoMapAttribute` → `VeloxMapper` namespace'i; DI uzantıları →
+  `Microsoft.Extensions.DependencyInjection` (`using VeloxMapper.DependencyInjection;` satırını kaldırın); `ProjectTo` →
+  `VeloxMapper.QueryableExtensions`.
+- DI'da `IMapper` transient olarak kaydedilir (derlenmiş eşleştirmeler `MapperConfiguration` üzerinde paylaşılır).
+- `ShouldMapField` varsayılanı public field'lar; `AddGlobalIgnore` ön ek eşleşmesi yapar; kurucu seçimi en çok parametreli çözülebilir kurucu.
+- Bağımlılık sürümleri hedef framework ile hizalandı (net8 → 8.0.x, net9 → 9.0.x, net10 → 10.0.x).
+
+### Düzeltilenler
+- DI'da singleton mapper'ın root provider ile scoped bağımlılıkları çözmesi.
+- `ProjectTo` içinde string birleştirme ve metot çağrılarının reddedilmesi; koleksiyon projeksiyonlarının `List<T>`'ye dönüşmemesi.
+- Adı `Proxy` ile biten sıradan sınıfların taban türe çözülmesi.
+- `IncludeBase` ve open generic kapatmada `ConstructUsing`, converter türü, `IncludeMembers` ve doğrulama ayarlarının kaybolması.
+- Döngüsel nesne grafiklerinde StackOverflow (referans koruması otomatik etkinleşir).
+- `ForPath` içinde `MapFrom((src, dest) => ...)` fonksiyonlarının yok sayılması; `ForMember` ile field hedefleri.
+
+---
 
 ---
 

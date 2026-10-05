@@ -15,6 +15,15 @@ namespace VeloxMapper.Generators;
 [Generator(LanguageNames.CSharp)]
 public sealed class MapperGenerator : IIncrementalGenerator
 {
+    /// <summary>VM003: [VeloxMap] çifti için derleme zamanı kodu üretilemedi (çalışma zamanı motoru kullanılır).</summary>
+    public static readonly DiagnosticDescriptor UnsupportedMappingRule = new(
+        id: "VM003",
+        title: "Derleme zamanı eşlemesi üretilemedi",
+        messageFormat: "'{0}' -> '{1}' için derleme zamanı eşlemesi üretilemedi: {2}. Bu çift çalışma zamanı motoruyla eşlenmeye devam eder.",
+        category: "VeloxMapper.Design",
+        defaultSeverity: DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         // [VeloxMap] attribute'larını tara.
@@ -50,6 +59,12 @@ public sealed class MapperGenerator : IIncrementalGenerator
             // Distinct ile aynı çiftin birden fazla kez üretilmesini önle
             foreach (var mapping in mappings.Distinct())
             {
+                if (mapping.SkipReason != null)
+                {
+                    spc.ReportDiagnostic(Diagnostic.Create(UnsupportedMappingRule, Location.None, mapping.SourceFullName, mapping.DestinationFullName, mapping.SkipReason));
+                    continue;
+                }
+
                 GenerateMappingMethod(sourceBuilder, mapping);
             }
 
@@ -59,6 +74,16 @@ public sealed class MapperGenerator : IIncrementalGenerator
             spc.AddSource("VeloxMapper.Generated.g.cs",
                 SourceText.From(sourceBuilder.ToString(), Encoding.UTF8));
         });
+    }
+
+    /// <summary>
+    /// Bir kaynak üye değerini hedef türe uygun ifade olarak yazar (Nullable açma, enum cast).
+    /// </summary>
+    private static string FormatValue(PropertyMapping pm)
+    {
+        var value = pm.NeedsNullCoalescing ? $"source.{pm.SourceName} ?? default" : $"source.{pm.SourceName}";
+        if (pm.NeedsEnumCast && !string.IsNullOrEmpty(pm.DestTypeFullName)) value = $"({pm.DestTypeFullName})({value})";
+        return value;
     }
 
     /// <summary>
@@ -84,33 +109,24 @@ public sealed class MapperGenerator : IIncrementalGenerator
         sb.AppendLine("        {");
         sb.AppendLine("            ArgumentNullException.ThrowIfNull(source);");
 
+        var ctorArgs = string.Join(", ", mapping.ConstructorArguments.Select(FormatValue));
+        sb.Append($"            return new {mapping.DestinationFullName}({ctorArgs})");
+
         if (mapping.PropertyMappings.Length > 0)
         {
-            sb.AppendLine($"            return new {mapping.DestinationFullName}");
+            sb.AppendLine();
             sb.AppendLine("            {");
             for (int i = 0; i < mapping.PropertyMappings.Length; i++)
             {
                 var pm = mapping.PropertyMappings[i];
                 var comma = i < mapping.PropertyMappings.Length - 1 ? "," : "";
-
-                // Nullable<T> → T dönüşümü: null-coalescing operatörü ekle
-                var assignment = pm.NeedsNullCoalescing
-                    ? $"source.{pm.SourceName} ?? default"
-                    : $"source.{pm.SourceName}";
-
-                // Farklı namespace/isimlerdeki Enum tipleri için explicit cast ekle
-                if (pm.NeedsEnumCast && !string.IsNullOrEmpty(pm.DestTypeFullName))
-                {
-                    assignment = $"({pm.DestTypeFullName})({assignment})";
-                }
-
-                sb.AppendLine($"                {pm.DestName} = {assignment}{comma}");
+                sb.AppendLine($"                {pm.DestName} = {FormatValue(pm)}{comma}");
             }
             sb.AppendLine("            };");
         }
         else
         {
-            sb.AppendLine($"            return new {mapping.DestinationFullName}();");
+            sb.AppendLine(";");
         }
 
         sb.AppendLine("        }");
@@ -144,10 +160,57 @@ public sealed class MapperGenerator : IIncrementalGenerator
             var srcProps = GetPublicProperties(srcType);
             var dstProps = GetPublicProperties(dstType);
 
+            var srcFullName = srcType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::", "");
+            var dstFullName = dstType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::", "");
+
+            if (dstType.IsAbstract || dstType.TypeKind == TypeKind.Interface)
+            {
+                result.Add(MappingInfo.Skipped(srcFullName, dstFullName, "hedef tür soyut veya arayüz"));
+                continue;
+            }
+
+            // Kurucu seçimi: parametresiz kurucu varsa nesne başlatıcı, yoksa parametreleri kaynaktan çözülebilen en geniş kurucu
+            var ctorArguments = new List<PropertyMapping>();
+            var publicCtors = dstType.InstanceConstructors.Where(c => c.DeclaredAccessibility == Accessibility.Public).ToArray();
+            var hasParameterless = dstType.IsValueType || publicCtors.Any(c => c.Parameters.Length == 0);
+            if (!hasParameterless)
+            {
+                IMethodSymbol? chosen = null;
+                foreach (var ctor in publicCtors.OrderByDescending(c => c.Parameters.Length))
+                {
+                    var arguments = new List<PropertyMapping>();
+                    foreach (var parameter in ctor.Parameters)
+                    {
+                        var match = srcProps.FirstOrDefault(s => string.Equals(s.Name, parameter.Name, System.StringComparison.OrdinalIgnoreCase));
+                        if (match == null) break;
+                        var (ok, coalesce, enumCast, destName) = CheckTypeCompatibility(match.Type, parameter.Type);
+                        if (!ok) break;
+                        arguments.Add(new PropertyMapping(match.Name, parameter.Name, coalesce, enumCast, destName));
+                    }
+
+                    if (arguments.Count == ctor.Parameters.Length)
+                    {
+                        chosen = ctor;
+                        ctorArguments = arguments;
+                        break;
+                    }
+                }
+
+                if (chosen == null)
+                {
+                    result.Add(MappingInfo.Skipped(srcFullName, dstFullName, "parametreleri kaynaktan çözülebilen public bir kurucu yok"));
+                    continue;
+                }
+            }
+
             var propertyMappings = new List<PropertyMapping>();
 
             foreach (var dstProp in dstProps)
             {
+                // Yalnızca public setter/init erişimcisi olan ve kurucuya verilmeyen üyeler nesne başlatıcıda atanır
+                if (dstProp.SetMethod == null || dstProp.SetMethod.DeclaredAccessibility != Accessibility.Public) continue;
+                if (ctorArguments.Any(a => string.Equals(a.DestName, dstProp.Name, System.StringComparison.OrdinalIgnoreCase))) continue;
+
                 // Case-insensitive isim eşleştirmesi
                 var srcProp = srcProps.FirstOrDefault(s =>
                     string.Equals(s.Name, dstProp.Name, System.StringComparison.OrdinalIgnoreCase));
@@ -160,10 +223,7 @@ public sealed class MapperGenerator : IIncrementalGenerator
                 propertyMappings.Add(new PropertyMapping(srcProp.Name, dstProp.Name, needsNullCoalescing, needsEnumCast, destTypeFullName));
             }
 
-            result.Add(new MappingInfo(
-                srcType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::", ""),
-                dstType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat).Replace("global::", ""),
-                propertyMappings.ToArray()));
+            result.Add(new MappingInfo(srcFullName, dstFullName, propertyMappings.ToArray(), ctorArguments.ToArray(), null));
         }
 
         return result;
@@ -243,12 +303,24 @@ internal readonly struct MappingInfo
     public string DestinationFullName { get; }
     public PropertyMapping[] PropertyMappings { get; }
 
-    public MappingInfo(string sourceFullName, string destinationFullName, PropertyMapping[] propertyMappings)
+    /// <summary>Kurucuya sırasıyla verilecek argümanlar (parametresiz kurucuda boş).</summary>
+    public PropertyMapping[] ConstructorArguments { get; }
+
+    /// <summary>Kod üretilemiyorsa nedeni (VM003 tanılaması); aksi halde <c>null</c>.</summary>
+    public string? SkipReason { get; }
+
+    public MappingInfo(string sourceFullName, string destinationFullName, PropertyMapping[] propertyMappings,
+        PropertyMapping[] constructorArguments, string? skipReason)
     {
         SourceFullName = sourceFullName;
         DestinationFullName = destinationFullName;
         PropertyMappings = propertyMappings;
+        ConstructorArguments = constructorArguments;
+        SkipReason = skipReason;
     }
+
+    public static MappingInfo Skipped(string sourceFullName, string destinationFullName, string reason)
+        => new(sourceFullName, destinationFullName, new PropertyMapping[0], new PropertyMapping[0], reason);
 
     public override bool Equals(object obj)
     {

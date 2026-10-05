@@ -1,159 +1,150 @@
 using System;
+using System.Collections.Generic;
 using System.Linq.Expressions;
 
 namespace VeloxMapper.Configuration;
 
 /// <summary>
-/// ForMember ile tanımlanan tek bir üye (property) eşleştirme kuralını temsil eder.
-/// Bir hedef property için ya özel kaynak ifadesi (MapFrom) ya da yok sayma (Ignore) belirlenir.
+/// Tek bir hedef üye için toplanan eşleştirme kuralı (<c>ForMember</c>, <c>ForPath</c>, <c>ForAllMembers</c> çıktısı).
+/// Yapılandırma dondurulduktan sonra salt-okunur olarak kullanılır.
 /// </summary>
 public sealed class MemberMappingRule
 {
-    /// <summary>
-    /// Hedef property adı. ForMember ifadesinden çözümlenir.
-    /// </summary>
-    public string DestinationMemberName { get; }
+    private List<LambdaExpression>? _transformers;
 
-    /// <summary>
-    /// Eğer true ise bu property mapping sırasında atlanır.
-    /// </summary>
-    /// <summary>
-    /// Eğer true ise bu property mapping sırasında atlanır.
-    /// </summary>
-    public bool IsIgnored { get; }
-
-    /// <summary>
-    /// Eğer true ise bu property mapping sırasında atlanır ve doğrulama dışı bırakılır.
-    /// </summary>
-    public bool IsDoNotValidate { get; }
-
-    /// <summary>
-    /// Özel kaynak ifadesi (MapFrom ile belirtilmiş lambda).
-    /// Null ise ignore kuralıdır.
-    /// </summary>
-    public LambdaExpression? MapFromExpression { get; }
-
-    /// <summary>
-    /// IVeloxValueResolver tipi (DI ile çözümlenecek).
-    /// </summary>
-    public Type? ResolverType { get; internal set; }
-
-    /// <summary>
-    /// IVeloxMemberValueResolver tipi.
-    /// </summary>
-    public Type? MemberValueResolverType { get; internal set; }
-
-    /// <summary>
-    /// MemberValueResolver için kaynak üye ifadesi.
-    /// </summary>
-    public LambdaExpression? SourceMemberForResolver { get; internal set; }
-
-    /// <summary>
-    /// IVeloxValueConverter örneği (DI gerektirmez, doğrudan kullanılabilir).
-    /// </summary>
-    public object? ValueConverter { get; internal set; }
-
-    /// <summary>
-    /// IVeloxValueConverter tipi (DI gerektirebilir).
-    /// </summary>
-    public Type? ValueConverterType { get; internal set; }
-
-    /// <summary>
-    /// ValueConverter için kaynak üye ifadesi.
-    /// </summary>
-    public LambdaExpression? ValueConverterSourceMember { get; internal set; }
-
-    /// <summary>
-    /// Condition koşul delegesi.
-    /// </summary>
-    public Delegate? ConditionDelegate { get; internal set; }
-
-    /// <summary>
-    /// PreCondition koşul delegesi.
-    /// </summary>
-    public Delegate? PreConditionDelegate { get; internal set; }
-
-    /// <summary>
-    /// NullSubstitute varsayılan değeri.
-    /// </summary>
-    public object? NullSubstituteValue { get; internal set; }
-
-    /// <summary>
-    /// NullSubstitute değeri tanımlı mı?
-    /// </summary>
-    public bool HasNullSubstitute { get; }
-
-    /// <summary>
-    /// Hedef değer korunsun mu? (UseDestinationValue ile belirtilmiş)
-    /// </summary>
-    public bool KeepDestinationValue { get; }
-
-    /// <summary>
-    /// Eşleştirme sırası (SetMappingOrder ile belirtilmiş). Varsayılan: 0.
-    /// </summary>
-    public int MappingOrder { get; }
-
-    /// <summary>
-    /// Yok sayma (Ignore) kuralı oluşturur.
-    /// </summary>
     internal MemberMappingRule(string destinationMemberName)
     {
-        DestinationMemberName = destinationMemberName
-            ?? throw new ArgumentNullException(nameof(destinationMemberName));
-        IsIgnored = true;
-        IsDoNotValidate = false;
-        MapFromExpression = null;
-    }
-
-    /// <summary>
-    /// Özel kaynak eşleştirmesi (MapFrom) kuralı oluşturur.
-    /// </summary>
-    internal MemberMappingRule(string destinationMemberName, LambdaExpression mapFromExpression)
-    {
-        DestinationMemberName = destinationMemberName
-            ?? throw new ArgumentNullException(nameof(destinationMemberName));
-        MapFromExpression = mapFromExpression
-            ?? throw new ArgumentNullException(nameof(mapFromExpression));
-        IsIgnored = false;
-        IsDoNotValidate = false;
-    }
-
-    /// <summary>
-    /// Tüm parametreleri alan detaylı constructor.
-    /// </summary>
-    internal MemberMappingRule(
-        string destinationMemberName,
-        bool isIgnored,
-        bool isDoNotValidate,
-        LambdaExpression? mapFromExpression,
-        Type? resolverType,
-        Type? memberValueResolverType,
-        LambdaExpression? sourceMemberForResolver,
-        object? valueConverter,
-        Type? valueConverterType,
-        LambdaExpression? valueConverterSourceMember,
-        Delegate? conditionDelegate,
-        Delegate? preConditionDelegate,
-        object? nullSubstituteValue,
-        bool hasNullSubstitute,
-        bool keepDestinationValue,
-        int mappingOrder)
-    {
         DestinationMemberName = destinationMemberName ?? throw new ArgumentNullException(nameof(destinationMemberName));
-        IsIgnored = isIgnored;
-        IsDoNotValidate = isDoNotValidate;
-        MapFromExpression = mapFromExpression;
-        ResolverType = resolverType;
-        MemberValueResolverType = memberValueResolverType;
-        SourceMemberForResolver = sourceMemberForResolver;
-        ValueConverter = valueConverter;
-        ValueConverterType = valueConverterType;
-        ValueConverterSourceMember = valueConverterSourceMember;
-        ConditionDelegate = conditionDelegate;
-        PreConditionDelegate = preConditionDelegate;
-        NullSubstituteValue = nullSubstituteValue;
-        HasNullSubstitute = hasNullSubstitute;
-        KeepDestinationValue = keepDestinationValue;
-        MappingOrder = mappingOrder;
+    }
+
+    internal MemberMappingRule(string destinationMemberName, LambdaExpression mapFromExpression)
+        : this(destinationMemberName)
+    {
+        MapFromExpression = mapFromExpression ?? throw new ArgumentNullException(nameof(mapFromExpression));
+    }
+
+    /// <summary>Hedef üye adı.</summary>
+    public string DestinationMemberName { get; internal set; }
+
+    /// <summary>Üye eşleştirme ve doğrulama dışında bırakıldıysa <c>true</c>.</summary>
+    public bool IsIgnored { get; internal set; }
+
+    /// <summary>Üye yalnızca doğrulamadan muaf tutulduysa <c>true</c> (<c>DoNotValidate</c>).</summary>
+    public bool IsDoNotValidate { get; internal set; }
+
+    /// <summary><c>MapFrom(src =&gt; ...)</c> ile verilen kaynak ifadesi.</summary>
+    public LambdaExpression? MapFromExpression { get; internal set; }
+
+    /// <summary><c>MapFrom("A.B")</c> ile verilen kaynak üye yolu.</summary>
+    public string? SourceMemberPath { get; internal set; }
+
+    /// <summary><c>MapFrom((src, dest, ...) =&gt; ...)</c> ile verilen fonksiyon.</summary>
+    public Delegate? MapFromFunc { get; internal set; }
+
+    /// <summary><see cref="MapFromFunc"/> parametre sayısı (2, 3 veya 4).</summary>
+    public int MapFromFuncArity { get; internal set; }
+
+    /// <summary>Value resolver türü.</summary>
+    public Type? ResolverType { get; internal set; }
+
+    /// <summary>Value resolver örneği.</summary>
+    public object? ResolverInstance { get; internal set; }
+
+    /// <summary>Member value resolver türü.</summary>
+    public Type? MemberValueResolverType { get; internal set; }
+
+    /// <summary>Member value resolver örneği.</summary>
+    public object? MemberValueResolverInstance { get; internal set; }
+
+    /// <summary>Member value resolver girdisi olan kaynak üye ifadesi.</summary>
+    public LambdaExpression? SourceMemberForResolver { get; internal set; }
+
+    /// <summary>Member value resolver girdisi olan kaynak üye adı.</summary>
+    public string? SourceMemberNameForResolver { get; internal set; }
+
+    /// <summary>Value converter örneği.</summary>
+    public object? ValueConverter { get; internal set; }
+
+    /// <summary>Value converter türü.</summary>
+    public Type? ValueConverterType { get; internal set; }
+
+    /// <summary>Value converter girdisi olan kaynak üye ifadesi.</summary>
+    public LambdaExpression? ValueConverterSourceMember { get; internal set; }
+
+    /// <summary>Value converter girdisi olan kaynak üye adı (null ise hedef üye adı kullanılır).</summary>
+    public string? ValueConverterSourceMemberName { get; internal set; }
+
+    /// <summary>True ise value converter tanımlıdır.</summary>
+    public bool HasValueConverter => ValueConverter != null || ValueConverterType != null;
+
+    /// <summary>Koşul delegesi (<c>Condition</c>).</summary>
+    public Delegate? ConditionDelegate { get; internal set; }
+
+    /// <summary>Ön koşul delegesi (<c>PreCondition</c>).</summary>
+    public Delegate? PreConditionDelegate { get; internal set; }
+
+    /// <summary><c>NullSubstitute</c> değeri.</summary>
+    public object? NullSubstituteValue { get; internal set; }
+
+    /// <summary><c>NullSubstitute</c> tanımlıysa <c>true</c>.</summary>
+    public bool HasNullSubstitute { get; internal set; }
+
+    /// <summary><c>UseDestinationValue</c> (true) / <c>DoNotUseDestinationValue</c> (false) tercihi; <c>null</c> ise varsayılan davranış.</summary>
+    public bool? UseDestinationValue { get; internal set; }
+
+    /// <summary>Hedef üyenin mevcut değeri korunacaksa <c>true</c>.</summary>
+    public bool KeepDestinationValue => UseDestinationValue == true;
+
+    /// <summary>Atanma sırası (<c>SetMappingOrder</c>); varsayılan 0.</summary>
+    public int MappingOrder { get; internal set; }
+
+    /// <summary><c>ExplicitExpansion</c> ile işaretlendiyse <c>true</c>.</summary>
+    public bool ExplicitExpansion { get; internal set; }
+
+    /// <summary><c>AllowNull</c> (true) / <c>DoNotAllowNull</c> (false) tercihi; <c>null</c> ise profil ayarı geçerlidir.</summary>
+    public bool? AllowNull { get; internal set; }
+
+    /// <summary>Üyeye özel value transformer ifadeleri.</summary>
+    public IReadOnlyList<LambdaExpression> Transformers => (IReadOnlyList<LambdaExpression>?)_transformers ?? Array.Empty<LambdaExpression>();
+
+    /// <summary>Üyenin değeri için açık bir kaynak (MapFrom, resolver veya converter) belirtildiyse <c>true</c>.</summary>
+    public bool HasValueSource =>
+        MapFromExpression != null || SourceMemberPath != null || MapFromFunc != null ||
+        ResolverType != null || ResolverInstance != null ||
+        MemberValueResolverType != null || MemberValueResolverInstance != null ||
+        HasValueConverter;
+
+    internal void AddTransformer(LambdaExpression transformer)
+    {
+        (_transformers ??= new List<LambdaExpression>()).Add(transformer);
+    }
+
+    /// <summary>Tüm değer kaynaklarını temizler (yeni bir MapFrom/ConvertUsing çağrısından önce).</summary>
+    internal void ClearValueSource()
+    {
+        MapFromExpression = null;
+        SourceMemberPath = null;
+        MapFromFunc = null;
+        MapFromFuncArity = 0;
+        ResolverType = null;
+        ResolverInstance = null;
+        MemberValueResolverType = null;
+        MemberValueResolverInstance = null;
+        SourceMemberForResolver = null;
+        SourceMemberNameForResolver = null;
+        ValueConverter = null;
+        ValueConverterType = null;
+        ValueConverterSourceMember = null;
+        ValueConverterSourceMemberName = null;
+        IsIgnored = false;
+    }
+
+    /// <summary>Kuralın bağımsız bir kopyasını üretir.</summary>
+    internal MemberMappingRule Clone(string? newName = null)
+    {
+        var copy = (MemberMappingRule)MemberwiseClone();
+        if (newName != null) copy.DestinationMemberName = newName;
+        copy._transformers = _transformers != null ? new List<LambdaExpression>(_transformers) : null;
+        return copy;
     }
 }

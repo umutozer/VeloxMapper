@@ -3,1793 +3,1354 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using VeloxMapper.Abstractions;
+using VeloxMapper.Attributes;
 using VeloxMapper.Caching;
 using VeloxMapper.Configuration;
 using VeloxMapper.Exceptions;
-using VeloxMapper.Attributes;
-using VeloxMapper.Abstractions;
 
 namespace VeloxMapper.Execution;
 
 /// <summary>
-/// Source Generator (Layer 1) üretimi olmayan türler için çalışma zamanında (Layer 2)
-/// Expression Tree tabanlı deterministik eşleştirme kodu üreten sınıf.
-/// Üretilen delegate'ler ConcurrentDictionary ile önbelleklenir ve strongly-typed çağrılır.
+/// Çalışma zamanı (Layer 2) eşleştirme ifadelerini üretir. Üç çıktı türü vardır:
+/// <list type="bullet">
+/// <item><b>Map</b>: <c>Func&lt;TSource, VeloxResolutionContext, TDestination&gt;</c> — yeni nesne oluşturur.</item>
+/// <item><b>Patch</b>: <c>Func&lt;TSource, TDestination, VeloxResolutionContext, TDestination&gt;</c> — mevcut nesneye eşler.</item>
+/// <item><b>ProjectTo</b>: <c>Expression&lt;Func&lt;TSource, TDestination&gt;&gt;</c> — EF Core tarafından SQL'e çevrilebilir saf ifade.</item>
+/// </list>
+/// İç içe karmaşık türler Map/Patch modunda çalışma zamanı çağrısıyla (önbellekten), ProjectTo modunda satır içi eşlenir.
 /// </summary>
 internal static class ExpressionBuilder
 {
-    /// <summary>
-    /// DI üzerinden resolver veya converter tiplerini çözümlemek için kullanılan yardımcı metot.
-    /// </summary>
-    public static object ResolveService(VeloxResolutionContext context, Type serviceType)
+    private static readonly Type ContextType = typeof(VeloxResolutionContext);
+    private static readonly MethodInfo ResolveServiceMethod = typeof(RuntimeServices).GetMethod(nameof(RuntimeServices.Resolve))!;
+    private static readonly MethodInfo MapNestedMethod = typeof(Mapper).GetMethod(nameof(Mapper.MapNested), BindingFlags.NonPublic | BindingFlags.Static)!;
+    private static readonly PropertyInfo CurrentMemberProperty = typeof(ResolutionContext).GetProperty(nameof(ResolutionContext.CurrentMember))!;
+    private static readonly PropertyInfo CurrentDepthProperty = typeof(ResolutionContext).GetProperty("CurrentDepth", BindingFlags.NonPublic | BindingFlags.Instance)!;
+    private static readonly PropertyInfo ReferenceCacheProperty = typeof(ResolutionContext).GetProperty("ReferenceCache", BindingFlags.NonPublic | BindingFlags.Instance)!;
+    private static readonly MethodInfo CacheTryGetMethod = typeof(VeloxReferenceCache).GetMethod(nameof(VeloxReferenceCache.TryGetValue))!;
+    private static readonly MethodInfo CacheSetMethod = typeof(VeloxReferenceCache).GetMethod(nameof(VeloxReferenceCache.Set))!;
+    private static readonly MethodInfo ObjectToStringMethod = typeof(object).GetMethod(nameof(ToString), Type.EmptyTypes)!;
+
+    // ─── Giriş noktaları ────────────────────────────────────────────────────
+
+    /// <summary>Yeni nesne oluşturan eşleştirme lambda'sını üretir: <c>(source, context) =&gt; destination</c>.</summary>
+    public static LambdaExpression BuildMapLambda(Type sourceType, Type destinationType, MapperConfiguration config)
     {
-        if (context.ServiceProvider != null)
+        config.DiagnosticsSink?.Log($"Map ifadesi üretiliyor: {sourceType.Name} -> {destinationType.Name}", "Debug");
+        var source = Expression.Parameter(sourceType, "source");
+        var context = Expression.Parameter(ContextType, "context");
+        var scope = new BuildScope(config, MappingMode.Map, context);
+        var body = ExpressionUtil.Coerce(MapRoot(source, destinationType, null, scope), destinationType);
+        return Expression.Lambda(typeof(Func<,,>).MakeGenericType(sourceType, ContextType, destinationType), body, source, context);
+    }
+
+    /// <summary>Mevcut nesneye eşleyen lambda'yı üretir: <c>(source, destination, context) =&gt; destination</c>.</summary>
+    public static LambdaExpression BuildPatchLambda(Type sourceType, Type destinationType, MapperConfiguration config)
+    {
+        config.DiagnosticsSink?.Log($"Patch ifadesi üretiliyor: {sourceType.Name} -> {destinationType.Name}", "Debug");
+        var source = Expression.Parameter(sourceType, "source");
+        var destination = Expression.Parameter(destinationType, "destination");
+        var context = Expression.Parameter(ContextType, "context");
+        var patchScope = new BuildScope(config, MappingMode.Patch, context);
+
+        Expression body = ExpressionUtil.Coerce(MapRoot(source, destinationType, destination, patchScope), destinationType);
+        if (ExpressionUtil.CanBeNull(destinationType))
         {
-            var service = context.ServiceProvider.GetService(serviceType);
-            if (service != null) return service;
+            // Hedef null ise yeni nesne oluşturulur (AutoMapper davranışı)
+            var mapScope = new BuildScope(config, MappingMode.Map, context);
+            var create = ExpressionUtil.Coerce(MapRoot(source, destinationType, null, mapScope), destinationType);
+            body = Expression.Condition(ExpressionUtil.IsNull(destination), create, body);
         }
-        return Activator.CreateInstance(serviceType)
-            ?? throw new InvalidOperationException($"'{serviceType.FullName}' türünde bir servis veya nesne oluşturulamadı.");
+
+        return Expression.Lambda(typeof(Func<,,,>).MakeGenericType(sourceType, destinationType, ContextType, destinationType), body, source, destination, context);
     }
 
     /// <summary>
-    /// Map işlemi için <c>Func&lt;object, object&gt;</c> veya <c>Func&lt;object, VeloxResolutionContext, object&gt;</c> tipinde bir delegate üretir.
+    /// <c>ProjectTo</c> için saf (yan etkisiz, çalışma zamanı çağrısı içermeyen) projeksiyon ifadesi üretir.
     /// </summary>
-    public static Delegate BuildMapDelegate(Type source, Type destination, MapperConfiguration config)
+    public static LambdaExpression BuildProjectionLambda(Type sourceType, Type destinationType, MapperConfiguration config, IReadOnlyCollection<string> membersToExpand)
     {
-        config.DiagnosticsSink?.Log($"Building map delegate for {source.Name} -> {destination.Name}", "Information");
-        var registration = config.GetRegistration(source, destination);
-        bool requiresContext = registration?.RequiresContext == true;
+        config.DiagnosticsSink?.Log($"ProjectTo ifadesi üretiliyor: {sourceType.Name} -> {destinationType.Name}", "Debug");
+        var source = Expression.Parameter(sourceType, "source");
+        var scope = new BuildScope(config, MappingMode.ProjectTo, null) { Expansions = new HashSet<string>(membersToExpand, StringComparer.OrdinalIgnoreCase) };
+        var body = ExpressionUtil.Coerce(MapRoot(source, destinationType, null, scope), destinationType);
+        return Expression.Lambda(typeof(Func<,>).MakeGenericType(sourceType, destinationType), body, source);
+    }
 
-        var param = Expression.Parameter(typeof(object), "source");
-        var castedSource = Expression.Convert(param, source);
+    // ─── Kök ve değer eşleştirme ────────────────────────────────────────────
 
-        if (requiresContext)
+    private static Expression MapRoot(Expression source, Type destinationType, Expression? existing, BuildScope scope)
+    {
+        var registration = scope.Config.FindRegistration(source.Type, destinationType);
+        var profile = scope.Config.GetProfile(registration);
+        var mapped = MapValue(source, destinationType, existing, scope, profile, allowNull: null, inlineTypeMap: true);
+        return mapped ?? throw new VeloxConfigurationException(
+            $"'{source.Type.FullName}' türü '{destinationType.FullName}' türüne eşlenemiyor. " +
+            "Bir CreateMap tanımı veya ConvertUsing ile özel dönüştürücü ekleyin.");
+    }
+
+    /// <summary>
+    /// Bir değeri hedef türe dönüştüren ifade üretir. Eşlenemiyorsa <c>null</c> döner.
+    /// </summary>
+    /// <param name="value">Kaynak değer ifadesi.</param>
+    /// <param name="destinationType">Hedef tür.</param>
+    /// <param name="existing">Yerinde eşlenecek mevcut hedef değer (yoksa <c>null</c>).</param>
+    /// <param name="scope">Üretim kapsamı.</param>
+    /// <param name="profile">Geçerli profil ayarları.</param>
+    /// <param name="allowNull">Üye düzeyinde AllowNull/DoNotAllowNull tercihi.</param>
+    /// <param name="inlineTypeMap">True ise karmaşık tür eşleştirmesi satır içi üretilir (kök çağrı).</param>
+    internal static Expression? MapValue(Expression value, Type destinationType, Expression? existing, BuildScope scope, ProfileMap profile, bool? allowNull, bool inlineTypeMap)
+    {
+        var sourceType = value.Type;
+        var config = scope.Config;
+        var registration = config.FindRegistration(sourceType, destinationType);
+
+        // 1. Kayıtlı tip dönüştürücü (ConvertUsing) her şeyden önce gelir
+        if (registration != null && registration.HasTypeConverter)
         {
-            var contextParam = Expression.Parameter(typeof(VeloxResolutionContext), "context");
-            var body = BuildMapBody(castedSource, source, destination, config, contextParam, MappingMode.Map);
-            var boxedBody = Expression.Convert(body, typeof(object));
-            var lambda = Expression.Lambda<Func<object, VeloxResolutionContext, object>>(boxedBody, param, contextParam);
-            try
-            {
-                return lambda.Compile();
-            }
-            catch (Exception ex)
-            {
-                throw new VeloxMappingException($"Expression compilation failed for {source.Name} -> {destination.Name}. Expression: {lambda}", ex);
-            }
+            if (inlineTypeMap || scope.IsProjection) return BuildTypeMap(value, registration, destinationType, existing, scope);
+            return RuntimeCall(value, destinationType, existing, scope, profile, allowNull);
         }
-        else
+
+        // 2. Doğrudan atanabilir değerler (kayıt yoksa; koleksiyonlar her zaman kopyalanır)
+        var bothCollections = CollectionExpressionHelper.IsCollectionType(sourceType) && CollectionExpressionHelper.IsCollectionType(destinationType);
+        if (registration == null && !bothCollections && destinationType.IsAssignableFrom(sourceType))
         {
-            var body = BuildMapBody(castedSource, source, destination, config, null, MappingMode.Map);
-            var boxedBody = Expression.Convert(body, typeof(object));
-            var lambda = Expression.Lambda<Func<object, object>>(boxedBody, param);
-            try
+            return ExpressionUtil.Coerce(value, destinationType);
+        }
+
+        // 3. Sözlük → sözlük
+        if (CollectionExpressionHelper.TryGetDictionaryTypes(destinationType, out var destinationKey, out var destinationValue) &&
+            CollectionExpressionHelper.TryGetDictionaryTypes(sourceType, out var sourceKey, out var sourceValue) && !scope.IsProjection)
+        {
+            return BuildDictionary(value, sourceKey, sourceValue, destinationType, destinationKey, destinationValue, existing, scope, profile, allowNull);
+        }
+
+        // 4. Koleksiyon → koleksiyon
+        if (bothCollections && registration == null)
+        {
+            return BuildCollection(value, destinationType, existing, scope, profile, allowNull);
+        }
+
+        // 5. Nullable sarmalama / açma
+        var sourceUnderlying = Nullable.GetUnderlyingType(sourceType);
+        var destinationUnderlying = Nullable.GetUnderlyingType(destinationType);
+        if (sourceUnderlying != null)
+        {
+            var inner = MapValue(Expression.Property(value, "Value"), destinationType, null, scope, profile, allowNull, inlineTypeMap: false);
+            if (inner == null) return null;
+            return Expression.Condition(Expression.Property(value, "HasValue"), ExpressionUtil.Coerce(inner, destinationType), Expression.Default(destinationType));
+        }
+
+        if (destinationUnderlying != null)
+        {
+            var inner = MapValue(value, destinationUnderlying, null, scope, profile, allowNull, inlineTypeMap: false);
+            return inner == null ? null : Expression.Convert(inner, destinationType);
+        }
+
+        // 6. Enum ve yerleşik dönüşümler
+        var builtIn = TryBuiltInConversion(value, destinationType, scope);
+        if (builtIn != null) return builtIn;
+
+        // 7. Sözlük → nesne
+        if (typeof(System.Collections.IDictionary).IsAssignableFrom(sourceType) && IsComplex(destinationType) && !scope.IsProjection && registration == null)
+        {
+            return BuildFromDictionary(value, destinationType, scope);
+        }
+
+        // 8. Karmaşık tür → karmaşık tür
+        if (IsComplex(sourceType) && IsComplex(destinationType) || registration != null)
+        {
+            if (inlineTypeMap) return BuildTypeMap(value, registration, destinationType, existing, scope);
+
+            if (scope.IsProjection)
             {
-                return lambda.Compile();
+                var projected = BuildTypeMap(value, registration, destinationType, null, scope);
+                if (projected is ConstantExpression) return projected;
+                return ExpressionUtil.CanBeNull(sourceType) && profile.EnableNullPropagationForQueryMapping && value is not ParameterExpression
+                    ? Expression.Condition(ExpressionUtil.IsNull(value), Expression.Default(destinationType), projected)
+                    : projected;
             }
-            catch (Exception ex)
+
+            if (existing == null && CanInline(sourceType, destinationType, registration, scope))
             {
-                throw new VeloxMappingException($"Expression compilation failed for {source.Name} -> {destination.Name}. Expression: {lambda}", ex);
+                return InlineTypeMap(value, registration, destinationType, scope, allowNull ?? profile.AllowNullDestinationValues);
             }
+
+            return RuntimeCall(value, destinationType, existing, scope, profile, allowNull);
+        }
+
+        return null;
+    }
+
+    private const int MaxInlineDepth = 2;
+
+    /// <summary>
+    /// Alt eşleştirmenin üst ifadeye gömülüp gömülemeyeceğini belirler (AutoMapper'ın MaxExecutionPlanDepth yaklaşımı).
+    /// Polimorfik, referans korumalı, derinlik sınırlı veya rekürsif eşleştirmeler çalışma zamanı çağrısıyla yapılır.
+    /// </summary>
+    private static bool CanInline(Type sourceType, Type destinationType, MappingRegistration? registration, BuildScope scope)
+    {
+        if (scope.Mode != MappingMode.Map || scope.InlineStack.Count >= MaxInlineDepth) return false;
+        if (scope.InlineStack.Contains((sourceType, destinationType))) return false;
+        if (scope.Config.IsPrecompiled(sourceType, destinationType)) return false;
+        if (destinationType.IsAbstract || destinationType.IsInterface) return false;
+        if (typeof(System.Collections.IDictionary).IsAssignableFrom(sourceType)) return false;
+        return registration == null ||
+               (registration.IncludedDerivedTypes.Count == 0 && !registration.PreserveReferences && registration.MaxDepth == 0 &&
+                registration.RedirectDestinationType == null && !registration.HasTypeConverter);
+    }
+
+    private static Expression InlineTypeMap(Expression value, MappingRegistration? registration, Type destinationType, BuildScope scope, bool allowNullDestination)
+    {
+        scope.InlineStack.Add((value.Type, destinationType));
+        try
+        {
+            if (!ExpressionUtil.CanBeNull(value.Type)) return BuildTypeMap(value, registration, destinationType, null, scope);
+
+            var variable = Expression.Variable(value.Type, "nested");
+            var mapped = BuildTypeMap(variable, registration, destinationType, null, scope);
+            var parameterless = destinationType.GetConstructor(Type.EmptyTypes);
+            Expression whenNull = !allowNullDestination && parameterless != null ? Expression.New(parameterless) : Expression.Default(destinationType);
+            return Expression.Block(destinationType, new[] { variable },
+                Expression.Assign(variable, value),
+                Expression.Condition(ExpressionUtil.IsNull(variable), whenNull, ExpressionUtil.Coerce(mapped, destinationType)));
+        }
+        finally
+        {
+            scope.InlineStack.RemoveAt(scope.InlineStack.Count - 1);
         }
     }
 
     /// <summary>
-    /// Strongly-typed Map için <c>Func&lt;TSource, TDest&gt;</c> veya <c>Func&lt;TSource, VeloxResolutionContext, TDest&gt;</c> tipinde bir delege üretir.
+    /// İç içe karmaşık türü çalışma zamanı önbelleğinden (aynı bağlamla) eşleyen çağrı.
     /// </summary>
-    public static Delegate BuildStronglyTypedMapDelegate(Type source, Type destination, MapperConfiguration config)
+    private static Expression RuntimeCall(Expression value, Type destinationType, Expression? existing, BuildScope scope, ProfileMap profile, bool? allowNull)
     {
-        config.DiagnosticsSink?.Log($"Building strongly typed map delegate for {source.Name} -> {destination.Name}", "Information");
-        var registration = config.GetRegistration(source, destination);
-        bool requiresContext = registration?.RequiresContext == true;
-
-        var param = Expression.Parameter(source, "source");
-
-        if (requiresContext)
-        {
-            var contextParam = Expression.Parameter(typeof(VeloxResolutionContext), "context");
-            var body = BuildMapBody(param, source, destination, config, contextParam, MappingMode.Map);
-
-            var funcType = typeof(Func<,,>).MakeGenericType(source, typeof(VeloxResolutionContext), destination);
-            var lambda = Expression.Lambda(funcType, body, param, contextParam);
-            try
-            {
-                return lambda.Compile();
-            }
-            catch (Exception ex)
-            {
-                throw new VeloxMappingException($"Expression compilation failed for {source.Name} -> {destination.Name}. Expression: {lambda}", ex);
-            }
-        }
-        else
-        {
-            var body = BuildMapBody(param, source, destination, config, null, MappingMode.Map);
-
-            var funcType = typeof(Func<,>).MakeGenericType(source, destination);
-            var lambda = Expression.Lambda(funcType, body, param);
-            try
-            {
-                return lambda.Compile();
-            }
-            catch (Exception ex)
-            {
-                throw new VeloxMappingException($"Expression compilation failed for {source.Name} -> {destination.Name}. Expression: {lambda}", ex);
-            }
-        }
+        var method = MapNestedMethod.MakeGenericMethod(value.Type, destinationType);
+        return Expression.Call(method,
+            value,
+            existing != null ? ExpressionUtil.Coerce(existing, destinationType) : Expression.Default(destinationType),
+            Expression.Constant(existing != null),
+            scope.Context!,
+            Expression.Constant(allowNull ?? profile.AllowNullDestinationValues));
     }
 
-    /// <summary>
-    /// Patch işlemi için <c>Action&lt;TSource, TDestination&gt;</c> veya <c>Action&lt;TSource, TDestination, VeloxResolutionContext&gt;</c> tipinde bir delege üretir.
-    /// </summary>
-    public static Delegate BuildPatchDelegate(Type source, Type destination, MapperConfiguration config)
+    // ─── Tür eşleştirmesi (TypeMap) ─────────────────────────────────────────
+
+    private static Expression BuildTypeMap(Expression source, MappingRegistration? registration, Type destinationType, Expression? existing, BuildScope scope)
     {
-        config.DiagnosticsSink?.Log($"Building patch delegate for {source.Name} -> {destination.Name}", "Information");
-        var registration = config.GetRegistration(source, destination);
-        bool requiresContext = registration?.RequiresContext == true;
+        var config = scope.Config;
 
-        var sourceParam = Expression.Parameter(source, "source");
-        var destParam = Expression.Parameter(destination, "destination");
-
-        if (requiresContext)
-        {
-            var contextParam = Expression.Parameter(typeof(VeloxResolutionContext), "context");
-            var body = BuildPatchBody(sourceParam, destParam, source, destination, config, contextParam);
-
-            var delegateType = typeof(Action<,,>).MakeGenericType(source, destination, typeof(VeloxResolutionContext));
-            var lambda = Expression.Lambda(delegateType, body, sourceParam, destParam, contextParam);
-            return lambda.Compile();
-        }
-        else
-        {
-            var body = BuildPatchBody(sourceParam, destParam, source, destination, config, null);
-
-            var delegateType = typeof(Action<,>).MakeGenericType(source, destination);
-            var lambda = Expression.Lambda(delegateType, body, sourceParam, destParam);
-            return lambda.Compile();
-        }
-    }
-
-    /// <summary>
-    /// ProjectTo işlemi için <c>Expression&lt;Func&lt;TSource, TDest&gt;&gt;</c> döndürür.
-    /// </summary>
-    public static LambdaExpression BuildProjectToExpression(Type source, Type destination, MapperConfiguration config)
-    {
-        config.DiagnosticsSink?.Log($"Building ProjectTo expression for {source.Name} -> {destination.Name}", "Information");
-        var sourceParam = Expression.Parameter(source, "source");
-        var body = BuildMapBody(sourceParam, source, destination, config, null, MappingMode.ProjectTo);
-
-        var funcType = typeof(Func<,>).MakeGenericType(source, destination);
-        var lambda = Expression.Lambda(funcType, body, sourceParam);
-        return lambda;
-    }
-
-    /// <summary>
-    /// Kaynak türden hedef türe eşleme gövdesini oluşturur.
-    /// ForMember kuralları, koleksiyon, enum, nullable ve flattening desteği içerir.
-    /// </summary>
-    private static Expression BuildMapBody(
-        Expression sourceExpr, Type source, Type destination, MapperConfiguration config, ParameterExpression? contextParam, MappingMode mode)
-    {
-        var registration = config.GetRegistration(source, destination);
-
-        // As<T> yönlendirmesi kontrolü (RedirectDestinationType)
-        if (registration?.RedirectDestinationType != null)
+        if (registration?.RedirectDestinationType != null && registration.RedirectDestinationType != destinationType)
         {
             var redirectType = registration.RedirectDestinationType;
-            var redirectedExpr = BuildMapBody(sourceExpr, source, redirectType, config, contextParam, mode);
-            return Expression.Convert(redirectedExpr, destination);
+            var redirected = config.FindRegistration(source.Type, redirectType);
+            var existingRedirect = existing != null ? Expression.TypeAs(existing, redirectType) : null;
+            Expression redirectedBody = Expression.Convert(BuildTypeMap(source, redirected, redirectType, existingRedirect, scope), destinationType);
+            return scope.IsProjection ? redirectedBody : WrapIncludes(source, registration, destinationType, existing, redirectedBody, scope);
         }
 
-        // 1. Özel tip dönüştürücü (IVeloxTypeConverter) kontrolü
-        var converter = config.GetCustomConverter(source, destination);
-        if (converter != null && mode != MappingMode.ProjectTo)
+        if (registration != null && registration.HasTypeConverter)
         {
-            var converterType = converter.GetType();
-            var convertMethod = converterType.GetMethod("Convert")!;
-            Expression converterExpr;
-            if (contextParam != null && !typeof(IConstantConverter).IsAssignableFrom(converterType))
-            {
-                var resolveServiceMethod = typeof(ExpressionBuilder).GetMethod(nameof(ResolveService))!;
-                converterExpr = Expression.Convert(
-                    Expression.Call(resolveServiceMethod, contextParam, Expression.Constant(converterType)),
-                    converterType
-                );
-            }
-            else
-            {
-                converterExpr = Expression.Constant(converter);
-            }
-            return Expression.Call(converterExpr, convertMethod, sourceExpr);
+            return BuildConverterCall(source, registration, destinationType, existing, scope);
         }
 
-        // 0. İlkel tipler, string, Guid, DateTime vb. için erken çıkış
-        if (destination.IsPrimitive || destination == typeof(string) || destination == typeof(decimal) ||
-            destination == typeof(DateTime) || destination == typeof(Guid) || destination == typeof(TimeSpan))
+        if (!IsComplex(destinationType))
         {
-            if (destination.IsAssignableFrom(source))
-                return sourceExpr;
-            return Expression.Convert(sourceExpr, destination);
+            // Kayıt var ama hedef basit tür (ör. CreateMap<int, string>() dönüştürücüsüz): yerleşik dönüşüm
+            return TryBuiltInConversion(source, destinationType, scope)
+                   ?? throw new VeloxConfigurationException($"'{source.Type.FullName}' → '{destinationType.FullName}' için ConvertUsing tanımlayın.");
         }
 
-        // 2b. Dictionary mapping kontrolü
-        if (typeof(System.Collections.IDictionary).IsAssignableFrom(source) && !destination.IsPrimitive && destination != typeof(string))
+        if (scope.IsProjection) return BuildProjectionObject(source, registration, destinationType, scope);
+
+        if (typeof(System.Collections.IDictionary).IsAssignableFrom(source.Type) && existing == null && (registration == null || registration.MemberRules.Count == 0))
         {
-            var dictExpr = TryBuildDictionaryMapping(sourceExpr, source, destination, config, contextParam, mode);
-            if (dictExpr != null) return dictExpr;
+            return BuildFromDictionary(source, destinationType, scope);
         }
 
-        // 2. Koleksiyon mapping kontrolü
-        if (CollectionExpressionHelper.IsCollectionType(source) &&
-            CollectionExpressionHelper.IsCollectionType(destination))
-        {
-            var srcElementType = CollectionExpressionHelper.GetCollectionElementType(source);
-            var dstElementType = CollectionExpressionHelper.GetCollectionElementType(destination);
+        var profile = config.GetProfile(registration);
+        var hasFactory = registration != null && (registration.FactoryDelegate != null || registration.FactoryDelegateWithContext != null || registration.ConstructUsingServiceLocator);
+        Expression body = (destinationType.IsAbstract || destinationType.IsInterface) && existing == null && !hasFactory
+            ? Expression.Throw(
+                Expression.New(typeof(VeloxMappingException).GetConstructor(new[] { typeof(string) })!,
+                    Expression.Call(typeof(string).GetMethod(nameof(string.Concat), new[] { typeof(string), typeof(string), typeof(string) })!,
+                        Expression.Constant($"'{destinationType.Name}' soyut hedef türü için '"),
+                        Expression.Property(Expression.Call(Expression.Convert(source, typeof(object)), typeof(object).GetMethod(nameof(GetType))!), nameof(Type.Name)),
+                        Expression.Constant("' kaynağına uygun bir Include<,>() eşleştirmesi bulunamadı."))),
+                destinationType)
+            : BuildObject(source, registration, destinationType, existing, scope, profile);
 
-            if (srcElementType != null && dstElementType != null)
-            {
-                return CollectionExpressionHelper.BuildCollectionMapping(
-                    sourceExpr, srcElementType, dstElementType, destination,
-                    elementExpr => BuildPropertyAssignment(elementExpr, srcElementType, dstElementType, config, contextParam, registration?.ProfileName, mode)
-                                   ?? throw new VeloxMappingException($"Koleksiyon elemanı eşleştirilemedi: {srcElementType.FullName} -> {dstElementType.FullName}"),
-                    config.AllowNullCollections,
-                    mode);
-            }
+        body = WrapIncludes(source, registration, destinationType, existing, body, scope);
+
+        return WrapDepthAndReferences(source, registration, destinationType, body, scope);
+    }
+
+    /// <summary>
+    /// Polimorfik eşleştirme (Include / IncludeBase / IncludeAllDerived): kaynak çalışma zamanında türetilmiş bir türse
+    /// ilgili türetilmiş eşleştirmeye yönlendirir. Yalnızca yeni nesne oluşturulurken uygulanır.
+    /// </summary>
+    private static Expression WrapIncludes(Expression source, MappingRegistration? registration, Type destinationType, Expression? existing, Expression body, BuildScope scope)
+    {
+        if (registration == null || registration.IncludedDerivedTypes.Count == 0 || existing != null || scope.Context == null) return body;
+
+        foreach (var (derivedSource, derivedDestination) in registration.IncludedDerivedTypes
+                     .Where(t => source.Type.IsAssignableFrom(t.DerivedSource) && destinationType.IsAssignableFrom(t.DerivedDestination) &&
+                                 !(t.DerivedSource == source.Type && t.DerivedDestination == destinationType))
+                     .OrderBy(t => InheritanceDepth(t.DerivedSource)))
+        {
+            var derivedCall = Expression.Call(MapNestedMethod.MakeGenericMethod(derivedSource, derivedDestination),
+                Expression.Convert(source, derivedSource),
+                Expression.Default(derivedDestination),
+                Expression.Constant(false),
+                scope.Context,
+                Expression.Constant(true));
+            body = Expression.Condition(Expression.TypeIs(source, derivedSource), Expression.Convert(derivedCall, destinationType), body);
         }
 
-        // 3. Enum dönüşümü kontrolü
-        var enumExpr = TryBuildEnumConversion(sourceExpr, source, destination);
-        if (enumExpr != null) return enumExpr;
+        return body;
+    }
 
-        // 4. Nullable dönüşümü kontrolü
-        var nullableExpr = TryBuildNullableConversion(sourceExpr, source, destination, config, contextParam, registration?.ProfileName, mode);
-        if (nullableExpr != null) return nullableExpr;
+    private static Expression WrapDepthAndReferences(Expression source, MappingRegistration? registration, Type destinationType, Expression body, BuildScope scope)
+    {
+        if (registration == null || scope.Context == null) return body;
+        var context = scope.Context;
+        var result = Expression.Variable(destinationType, "result");
+        var flow = (Expression)Expression.Assign(result, body);
 
-        ConstructorInfo? selectedCtor = null;
-        Expression newExpr;
-        bool hasFactory = registration?.FactoryDelegate != null;
-        bool hasCondition = registration?.ForAllMembersCondition != null;
-        bool requiresContext = registration?.RequiresContext == true;
-
-        if (hasFactory)
+        if (registration.MaxDepth > 0)
         {
-            var factoryExpr = Expression.Constant(registration!.FactoryDelegate);
-            var boxedSource = Expression.Convert(sourceExpr, typeof(object));
-            var invokeExpr = Expression.Invoke(factoryExpr, boxedSource);
-            newExpr = Expression.Convert(invokeExpr, destination);
+            var depth = Expression.Property(context, CurrentDepthProperty);
+            flow = Expression.IfThenElse(
+                Expression.GreaterThanOrEqual(depth, Expression.Constant(registration.MaxDepth)),
+                Expression.Assign(result, Expression.Default(destinationType)),
+                Expression.Block(
+                    Expression.Assign(depth, Expression.Increment(depth)),
+                    Expression.TryFinally(flow, Expression.Assign(depth, Expression.Decrement(depth)))));
+        }
+
+        if (registration.PreserveReferences && !source.Type.IsValueType && !destinationType.IsValueType)
+        {
+            var cache = Expression.Property(context, ReferenceCacheProperty);
+            var cached = Expression.Variable(typeof(object), "cached");
+            flow = Expression.Block(new[] { cached },
+                Expression.IfThenElse(
+                    Expression.AndAlso(
+                        Expression.NotEqual(cache, Expression.Constant(null, typeof(VeloxReferenceCache))),
+                        Expression.Call(cache, CacheTryGetMethod, Expression.Convert(source, typeof(object)), cached)),
+                    Expression.Assign(result, Expression.Convert(cached, destinationType)),
+                    flow));
+        }
+
+        if (flow is BinaryExpression) return body; // ek sarmalama yok
+        return Expression.Block(new[] { result }, flow, result);
+    }
+
+    /// <summary>
+    /// Nesne oluşturur (veya mevcut nesneyi kullanır), BeforeMap → üye atamaları → ForPath → AfterMap sırasını uygular.
+    /// </summary>
+    private static Expression BuildObject(Expression source, MappingRegistration? registration, Type destinationType, Expression? existing, BuildScope scope, ProfileMap profile)
+    {
+        var dest = Expression.Variable(destinationType, "dest");
+        var statements = new List<Expression>();
+        var consumedByConstructor = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (existing != null)
+        {
+            statements.Add(Expression.Assign(dest, ExpressionUtil.Coerce(existing, destinationType)));
         }
         else
         {
-            // 6. Constructor seçim algoritması
-            var ctors = destination.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
-            if (ctors.Length == 0)
-            {
-                throw new VeloxConfigurationException(
-                    $"'{destination.FullName}' türü için public kurucu bulunamadı.");
-            }
-
-            selectedCtor = SelectConstructor(ctors, destination);
-
-            // 7. Constructor parametrelerini kaynak özelliklerinden eşle
-            var ctorParams = selectedCtor.GetParameters();
-            var arguments = new Expression[ctorParams.Length];
-            var sourceProps = source.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance).Where(config.ShouldMapProperty).ToArray();
-
-            for (int i = 0; i < ctorParams.Length; i++)
-            {
-                var p = ctorParams[i];
-                var ctorRule = registration?.CtorParamRules
-                    .FirstOrDefault(r => string.Equals(r.ParameterName, p.Name, StringComparison.OrdinalIgnoreCase));
-
-                if (ctorRule != null)
-                {
-                    var mapFromLambda = ctorRule.MapFromExpression;
-                    var body = new ParameterReplacer(mapFromLambda.Parameters[0], sourceExpr)
-                        .Visit(mapFromLambda.Body);
-
-                    body = MakeNullSafe(body);
-
-                    if (body.Type != p.ParameterType)
-                        arguments[i] = Expression.Convert(body, p.ParameterType);
-                    else
-                        arguments[i] = body;
-                }
-                else
-                {
-                    arguments[i] = ResolvePropertyExpression(
-                        sourceExpr, sourceProps, source, p.Name!, p.ParameterType, registration, config, contextParam, registration?.ProfileName, mode)
-                        ?? Expression.Default(p.ParameterType);
-                }
-            }
-
-            newExpr = Expression.New(selectedCtor, arguments);
+            statements.Add(Expression.Assign(dest, Construct(source, registration, destinationType, scope, profile, consumedByConstructor)));
         }
 
-        Expression mapExpr;
-
-        // Eğer tüm üyeler yoksayılacaksa doğrudan oluşturulan nesneyi dön
-        if (registration != null && registration.ForAllMembersIgnored)
+        if (registration?.PreserveReferences == true && !source.Type.IsValueType && !destinationType.IsValueType)
         {
-            mapExpr = newExpr;
+            var cache = Expression.Property(scope.Context!, ReferenceCacheProperty);
+            statements.Add(Expression.IfThen(Expression.Equal(cache, Expression.Constant(null, typeof(VeloxReferenceCache))),
+                Expression.Assign(cache, Expression.New(typeof(VeloxReferenceCache)))));
+            statements.Add(Expression.Call(cache, CacheSetMethod, Expression.Convert(source, typeof(object)), Expression.Convert(dest, typeof(object))));
         }
-        // Eğer factory veya custom condition varsa veya context gerekiyorsa veya ForPath kuralı varsa block tabanlı atama yap
-        else if ((hasFactory || hasCondition || requiresContext || (registration != null && registration.ForPathRules.Count > 0)) && mode != MappingMode.ProjectTo)
+
+        if (registration != null) statements.AddRange(BuildActions(registration.BeforeMapActions, source, dest, scope));
+
+        var members = TypeMembers.GetDestinationMembers(destinationType, profile)
+            .OrderBy(m => registration != null && registration.MemberRules.TryGetValue(m.Name, out var r) ? r.MappingOrder : 0)
+            .ToList();
+
+        foreach (var member in members)
         {
-            var destVar = Expression.Variable(destination, "dest");
-            var blockExprs = new List<Expression>
+            MemberMappingRule? rule = null;
+            registration?.MemberRules.TryGetValue(member.Name, out rule);
+            if (rule?.IsIgnored == true) continue;
+            if (rule == null && profile.IsGloballyIgnored(member.Name)) continue;
+            if (consumedByConstructor.Contains(member.Name)) continue;
+
+            var assignment = BuildMemberAssignment(source, dest, member, rule, registration, scope, profile);
+            if (assignment != null) statements.Add(assignment);
+        }
+
+        if (registration != null)
+        {
+            foreach (var pathRule in registration.ForPathRules)
             {
-                Expression.Assign(destVar, newExpr)
+                var pathAssignment = BuildForPath(source, dest, pathRule, registration, scope, profile);
+                if (pathAssignment != null) statements.Add(pathAssignment);
+            }
+
+            statements.AddRange(BuildActions(registration.AfterMapActions, source, dest, scope));
+        }
+
+        statements.Add(dest);
+        return Expression.Block(new[] { dest }, statements);
+    }
+
+    // ─── Nesne oluşturma ────────────────────────────────────────────────────
+
+    private static Expression Construct(Expression source, MappingRegistration? registration, Type destinationType, BuildScope scope, ProfileMap profile, HashSet<string> consumed)
+    {
+        if (registration?.FactoryDelegateWithContext != null && scope.Context != null)
+        {
+            return Expression.Convert(ExpressionUtil.InvokeDelegate(registration.FactoryDelegateWithContext, Expression.Convert(source, typeof(object)), scope.Context), destinationType);
+        }
+
+        if (registration?.FactoryDelegate != null)
+        {
+            return Expression.Convert(ExpressionUtil.InvokeDelegate(registration.FactoryDelegate, Expression.Convert(source, typeof(object))), destinationType);
+        }
+
+        if (registration?.ConstructUsingServiceLocator == true && scope.Context != null)
+        {
+            return Expression.Convert(Expression.Call(ResolveServiceMethod, scope.Context, Expression.Constant(destinationType)), destinationType);
+        }
+
+        var (ctor, arguments, error) = SelectConstructor(source, registration, destinationType, scope, profile);
+        if (ctor == null)
+        {
+            if (destinationType.IsValueType) return Expression.New(destinationType);
+            throw new VeloxAmbiguousConstructorException(destinationType, error!);
+        }
+
+        foreach (var parameter in ctor.GetParameters()) consumed.Add(parameter.Name!);
+        return Expression.New(ctor, arguments);
+    }
+
+    /// <summary>
+    /// Kurucu seçimi (AutoMapper ile uyumlu): <c>[VeloxConstructor]</c> varsa o; yoksa tüm parametreleri çözülebilen en
+    /// çok parametreli kurucu; hiçbiri çözülemezse parametresiz kurucu.
+    /// </summary>
+    internal static (ConstructorInfo? Ctor, Expression[] Arguments, string? Error) SelectConstructor(
+        Expression source, MappingRegistration? registration, Type destinationType, BuildScope scope, ProfileMap profile)
+    {
+        if (destinationType.IsAbstract || destinationType.IsInterface)
+        {
+            return (null, Array.Empty<Expression>(),
+                $"'{destinationType.FullName}' soyut bir tür veya arayüz olduğu için örneği oluşturulamaz. " +
+                "Include/As ile somut bir tür belirtin veya ConstructUsing kullanın.");
+        }
+
+        var ctors = destinationType.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+            .Where(profile.ShouldUseConstructor)
+            .ToList();
+
+        var marked = ctors.Where(c => c.IsDefined(typeof(VeloxConstructorAttribute), false)).ToList();
+        if (marked.Count > 1)
+        {
+            return (null, Array.Empty<Expression>(), $"'{destinationType.FullName}' türünde birden fazla [VeloxConstructor] kurucusu var; yalnızca birini işaretleyin.");
+        }
+
+        if (marked.Count == 1)
+        {
+            var args = TryResolveConstructorArguments(marked[0], source, registration, scope, profile, allowDefaults: true);
+            return (marked[0], args!, null);
+        }
+
+        if (!profile.ConstructorMappingEnabled)
+        {
+            var parameterless = ctors.FirstOrDefault(c => c.GetParameters().Length == 0);
+            return parameterless != null
+                ? (parameterless, Array.Empty<Expression>(), null)
+                : (null, Array.Empty<Expression>(), $"'{destinationType.FullName}' türünün parametresiz kurucusu yok ve kurucu eşleştirmesi kapalı (DisableConstructorMapping).");
+        }
+
+        foreach (var ctor in ctors.OrderByDescending(c => c.GetParameters().Length))
+        {
+            var args = TryResolveConstructorArguments(ctor, source, registration, scope, profile, allowDefaults: false);
+            if (args != null) return (ctor, args, null);
+        }
+
+        var signatures = string.Join(", ", ctors.Select(c => "(" + string.Join(", ", c.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name)) + ")"));
+        return (null, Array.Empty<Expression>(),
+            $"'{destinationType.FullName}' için parametreleri kaynak '{source.Type.FullName}' türünden çözülebilen bir kurucu bulunamadı. " +
+            $"Kurucular: {(signatures.Length == 0 ? "yok" : signatures)}. ForCtorParam, ConstructUsing veya parametresiz kurucu kullanın.");
+    }
+
+    private static Expression[]? TryResolveConstructorArguments(ConstructorInfo ctor, Expression source, MappingRegistration? registration, BuildScope scope, ProfileMap profile, bool allowDefaults)
+    {
+        var parameters = ctor.GetParameters();
+        var arguments = new Expression[parameters.Length];
+
+        for (var i = 0; i < parameters.Length; i++)
+        {
+            var parameter = parameters[i];
+            Expression? raw = null;
+
+            var ctorRule = registration?.CtorParamRules.FirstOrDefault(r => string.Equals(r.ParameterName, parameter.Name, StringComparison.OrdinalIgnoreCase));
+            if (ctorRule?.MapFromExpression != null)
+            {
+                raw = NullSafe(ExpressionUtil.ReplaceParameter(ctorRule.MapFromExpression, source), scope, profile);
+            }
+            else if (ctorRule?.MapFromFunc != null && scope.Context != null)
+            {
+                raw = ExpressionUtil.InvokeDelegate(ctorRule.MapFromFunc, source, scope.Context);
+            }
+            else if (registration != null && TryFindMemberRule(registration, parameter.Name!, out var memberRule) && memberRule.MapFromExpression != null && !memberRule.IsIgnored)
+            {
+                raw = NullSafe(ExpressionUtil.ReplaceParameter(memberRule.MapFromExpression, source), scope, profile);
+            }
+            else
+            {
+                var convention = ConventionResolver.Resolve(source, parameter.Name!, profile, registration, scope.Config);
+                if (convention != null) raw = NullSafe(convention, scope, profile);
+            }
+
+            Expression? value = raw == null ? null : MapValue(raw, parameter.ParameterType, null, scope, profile, null, inlineTypeMap: false);
+            if (value == null)
+            {
+                if (parameter.HasDefaultValue) value = Expression.Constant(parameter.DefaultValue, parameter.ParameterType);
+                else if (allowDefaults) value = Expression.Default(parameter.ParameterType);
+                else return null;
+            }
+
+            arguments[i] = ExpressionUtil.Coerce(value, parameter.ParameterType);
+        }
+
+        return arguments;
+    }
+
+    private static bool TryFindMemberRule(MappingRegistration registration, string name, out MemberMappingRule rule)
+    {
+        foreach (var kvp in registration.MemberRules)
+        {
+            if (string.Equals(kvp.Key, name, StringComparison.OrdinalIgnoreCase))
+            {
+                rule = kvp.Value;
+                return true;
+            }
+        }
+
+        rule = null!;
+        return false;
+    }
+
+    // ─── Üye ataması ────────────────────────────────────────────────────────
+
+    private static Expression? BuildMemberAssignment(Expression source, Expression dest, MemberInfo member, MemberMappingRule? rule,
+        MappingRegistration? registration, BuildScope scope, ProfileMap profile, Expression? target = null)
+    {
+        var owner = target ?? dest;
+        var memberType = TypeMembers.GetMemberType(member);
+        var access = Expression.MakeMemberAccess(owner, member);
+        var canWrite = TypeMembers.CanWrite(member);
+
+        var raw = ResolveRawValue(source, dest, access, member.Name, rule, registration, scope, profile);
+        if (raw == null) return null;
+
+        var context = scope.Context!;
+        var rawVariable = Expression.Variable(raw.Type, "src_" + member.Name);
+        var statements = new List<Expression>
+        {
+            Expression.Assign(Expression.Property(context, CurrentMemberProperty), Expression.Constant(member.Name)),
+            Expression.Assign(rawVariable, raw)
+        };
+
+        // UseDestinationValue: Patch modunda veya setter'ı olmayan koleksiyonlarda mevcut değere eşle
+        var useExisting = rule?.UseDestinationValue == true || (rule?.UseDestinationValue != false && (scope.Mode == MappingMode.Patch || !canWrite));
+        var existing = useExisting && IsReadable(member) && !memberType.IsValueType ? access : null;
+
+        Expression? mapped;
+        if (rule != null && rule.HasNullSubstitute && ExpressionUtil.CanBeNull(raw.Type))
+        {
+            var converted = MapValue(rawVariable, memberType, existing, scope, profile, rule.AllowNull, inlineTypeMap: false);
+            if (converted == null) return null;
+            mapped = Expression.Condition(ExpressionUtil.IsNull(rawVariable), SubstituteConstant(rule.NullSubstituteValue, memberType), ExpressionUtil.Coerce(converted, memberType));
+        }
+        else
+        {
+            mapped = MapValue(rawVariable, memberType, existing, scope, profile, rule?.AllowNull, inlineTypeMap: false);
+            if (mapped == null) return null;
+        }
+
+        mapped = ApplyTransformers(ExpressionUtil.Coerce(mapped, memberType), memberType, rule, registration, profile);
+
+        Expression write;
+        if (canWrite)
+        {
+            write = Expression.Assign(access, mapped);
+        }
+        else if (existing != null)
+        {
+            // Setter'ı olmayan koleksiyon: mevcut örnek yerinde doldurulur
+            write = Expression.IfThen(Expression.NotEqual(access, Expression.Constant(null, memberType)), mapped);
+        }
+        else
+        {
+            return null;
+        }
+
+        // Condition (AutoMapper: değer çözüldükten sonra, eşleştirmeden önce değerlendirilir)
+        if (rule?.ConditionDelegate != null)
+        {
+            var parameters = rule.ConditionDelegate.GetType().GetMethod("Invoke")!.GetParameters();
+            var arguments = new List<Expression> { source, dest };
+            if (parameters.Length >= 3) arguments.Add(ConditionValueArgument(rawVariable, mapped, parameters[2].ParameterType));
+            if (parameters.Length >= 4) arguments.Add(IsReadable(member) ? (Expression)access : Expression.Default(memberType));
+            if (parameters.Length >= 5) arguments.Add(context);
+            write = Expression.IfThen(ExpressionUtil.InvokeDelegate(rule.ConditionDelegate, arguments.ToArray()), write);
+        }
+
+        // PatchMapping.IgnoreNullValues (VeloxMapper seçeneği): mevcut nesneye eşlemede null kaynak değerleri atla
+        if (scope.Mode == MappingMode.Patch && scope.Config.IgnoreNullValues && ExpressionUtil.CanBeNull(raw.Type) && rule?.HasNullSubstitute != true)
+        {
+            write = Expression.IfThen(Expression.Not(ExpressionUtil.IsNull(rawVariable)), write);
+        }
+
+        statements.Add(write);
+        Expression block = Expression.Block(new[] { rawVariable }, statements);
+
+        // PreCondition: değer hiç çözülmeden önce
+        if (rule?.PreConditionDelegate != null)
+        {
+            var parameters = rule.PreConditionDelegate.GetType().GetMethod("Invoke")!.GetParameters();
+            var arguments = parameters.Length switch
+            {
+                1 => new[] { source },
+                2 => new[] { source, (Expression)context },
+                _ => new[] { source, dest, (Expression)context }
             };
-
-            // PreserveReferences aktifse, henüz property atamaları başlamadan önce cache'e ekle
-            if (registration != null && registration.PreserveReferences && contextParam != null)
-            {
-                var referenceCacheProp = typeof(VeloxResolutionContext).GetProperty("ReferenceCache", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!;
-                var cacheAccess = Expression.Property(contextParam, referenceCacheProp);
-
-                var cacheCtor = typeof(VeloxReferenceCache).GetConstructor(Type.EmptyTypes)!;
-                var newCacheExpr = Expression.New(cacheCtor);
-
-                var initCacheIfNull = Expression.IfThen(
-                    Expression.Equal(cacheAccess, Expression.Constant(null, typeof(VeloxReferenceCache))),
-                    Expression.Assign(cacheAccess, newCacheExpr)
-                );
-
-                var setMethod = typeof(VeloxReferenceCache).GetMethod("Set", new[] { typeof(object), typeof(object) })!;
-                var boxedSource = Expression.Convert(sourceExpr, typeof(object));
-                var boxedDest = Expression.Convert(destVar, typeof(object));
-                var addToCache = Expression.Call(cacheAccess, setMethod, boxedSource, boxedDest);
-
-                blockExprs.Add(initCacheIfNull);
-                blockExprs.Add(addToCache);
-            }
-
-            // BeforeMap eylemleri eklenir
-            if (registration != null && registration.BeforeMapActions.Count > 0 && contextParam != null)
-            {
-                var beforeMapExprs = BuildMappingActionsExpressions(
-                    registration.BeforeMapActions, sourceExpr, destVar, contextParam, source, destination);
-                blockExprs.AddRange(beforeMapExprs);
-            }
-
-            var destProps = destination.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(p => p.CanWrite && config.ShouldMapProperty(p))
-                .OrderBy(p => registration != null && registration.MemberRules.TryGetValue(p.Name, out var r) ? r.MappingOrder : 0)
-                .ToArray();
-            var sourceProps = source.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(config.ShouldMapProperty)
-                .ToArray();
-
-            foreach (var destProp in destProps)
-            {
-                // Global ignore edilmişse atla
-                if (config.GlobalIgnores.Contains(destProp.Name))
-                    continue;
-
-                // Ignore edilmiş property'leri atla
-                if (registration != null &&
-                    registration.MemberRules.TryGetValue(destProp.Name, out var rule) &&
-                    (rule.IsIgnored || rule.IsDoNotValidate))
-                    continue;
-
-                // Constructor'dan zaten verilen parametreleri atla (Factory değilse)
-                if (!hasFactory && selectedCtor != null)
-                {
-                    var ctorParams = selectedCtor.GetParameters();
-                    if (ctorParams.Any(cp => string.Equals(cp.Name, destProp.Name, StringComparison.OrdinalIgnoreCase)))
-                        continue;
-                }
-
-                // Resolver, condition, pre-condition ve null-substitute kurallarını işle
-                var propAssignExpr = BuildPropertyExpressionWithRules(
-                    sourceExpr, destVar, sourceProps, source, destProp.Name, destProp.PropertyType, registration, config, contextParam, mode);
-
-                if (propAssignExpr != null)
-                {
-                    blockExprs.Add(propAssignExpr);
-                }
-            }
-
-            var destFields = destination.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(f => !f.IsInitOnly && config.ShouldMapField(f))
-                .OrderBy(f => registration != null && registration.MemberRules.TryGetValue(f.Name, out var r) ? r.MappingOrder : 0)
-                .ToArray();
-
-            foreach (var destField in destFields)
-            {
-                if (config.GlobalIgnores.Contains(destField.Name))
-                    continue;
-
-                if (registration != null &&
-                    registration.MemberRules.TryGetValue(destField.Name, out var rule) &&
-                    (rule.IsIgnored || rule.IsDoNotValidate))
-                    continue;
-
-                if (!hasFactory && selectedCtor != null)
-                {
-                    var ctorParams = selectedCtor.GetParameters();
-                    if (ctorParams.Any(cp => string.Equals(cp.Name, destField.Name, StringComparison.OrdinalIgnoreCase)))
-                        continue;
-                }
-
-                var fieldAssignExpr = BuildPropertyExpressionWithRules(
-                    sourceExpr, destVar, sourceProps, source, destField.Name, destField.FieldType, registration, config, contextParam, mode);
-
-                if (fieldAssignExpr != null)
-                {
-                    blockExprs.Add(fieldAssignExpr);
-                }
-            }
-
-            // ForPath atamaları eklenir
-            if (registration != null && registration.ForPathRules.Count > 0)
-            {
-                var forPathExprs = BuildForPathExpressions(
-                    registration.ForPathRules, sourceExpr, destVar, config, contextParam, registration.ProfileName, mode);
-                blockExprs.AddRange(forPathExprs);
-            }
-
-            // AfterMap eylemleri eklenir
-            if (registration != null && registration.AfterMapActions.Count > 0 && contextParam != null)
-            {
-                var afterMapExprs = BuildMappingActionsExpressions(
-                    registration.AfterMapActions, sourceExpr, destVar, contextParam, source, destination);
-                blockExprs.AddRange(afterMapExprs);
-            }
-
-            blockExprs.Add(destVar);
-            mapExpr = Expression.Block(new[] { destVar }, blockExprs);
-        }
-        else
-        {
-            // 8. Constructor ile verilmemiş property'leri MemberInit ile bağla (Standart Mod)
-            var destPropsStandard = destination.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(p => p.CanWrite && config.ShouldMapProperty(p))
-                .OrderBy(p => registration != null && registration.MemberRules.TryGetValue(p.Name, out var r) ? r.MappingOrder : 0)
-                .ToArray();
-            var bindings = new List<MemberBinding>();
-            var sourcePropsStandard = source.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(config.ShouldMapProperty)
-                .ToArray();
-
-            foreach (var destProp in destPropsStandard)
-            {
-                // Global ignore edilmişse atla
-                if (config.GlobalIgnores.Contains(destProp.Name))
-                    continue;
-
-                // Ignore edilmiş property'leri atla
-                if (registration != null &&
-                    registration.MemberRules.TryGetValue(destProp.Name, out var rule) &&
-                    (rule.IsIgnored || rule.IsDoNotValidate))
-                    continue;
-
-                // Constructor'dan zaten verilen parametreleri atla
-                if (selectedCtor != null)
-                {
-                    var ctorParams = selectedCtor.GetParameters();
-                    if (ctorParams.Any(cp =>
-                        string.Equals(cp.Name, destProp.Name, StringComparison.OrdinalIgnoreCase)))
-                        continue;
-                }
-
-                var resolved = ResolvePropertyExpression(
-                    sourceExpr, sourcePropsStandard, source, destProp.Name, destProp.PropertyType, registration, config, contextParam, registration?.ProfileName, mode);
-
-                if (resolved != null)
-                {
-                    bindings.Add(Expression.Bind(destProp, resolved));
-                }
-            }
-
-            var destFieldsStandard = destination.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(f => !f.IsInitOnly && config.ShouldMapField(f))
-                .OrderBy(f => registration != null && registration.MemberRules.TryGetValue(f.Name, out var r) ? r.MappingOrder : 0)
-                .ToArray();
-
-            foreach (var destField in destFieldsStandard)
-            {
-                if (config.GlobalIgnores.Contains(destField.Name))
-                    continue;
-
-                if (registration != null &&
-                    registration.MemberRules.TryGetValue(destField.Name, out var rule) &&
-                    (rule.IsIgnored || rule.IsDoNotValidate))
-                    continue;
-
-                if (selectedCtor != null)
-                {
-                    var ctorParams = selectedCtor.GetParameters();
-                    if (ctorParams.Any(cp => string.Equals(cp.Name, destField.Name, StringComparison.OrdinalIgnoreCase)))
-                        continue;
-                }
-
-                var resolved = ResolvePropertyExpression(
-                    sourceExpr, sourcePropsStandard, source, destField.Name, destField.FieldType, registration, config, contextParam, registration?.ProfileName, mode);
-
-                if (resolved != null)
-                {
-                    bindings.Add(Expression.Bind(destField, resolved));
-                }
-            }
-
-            mapExpr = bindings.Count > 0
-                ? Expression.MemberInit((NewExpression)newExpr, bindings)
-                : newExpr;
+            block = Expression.IfThen(ExpressionUtil.InvokeDelegate(rule.PreConditionDelegate, arguments), block);
         }
 
-        // Polimorfik Haritalama (Include) Kontrolü
-        if (registration != null && registration.IncludedDerivedTypes.Count > 0 && contextParam != null && mode != MappingMode.ProjectTo)
-        {
-            var mapMethod = typeof(IVeloxMapper).GetMethods()
-                .First(m => m.Name == "Map" && 
-                            m.IsGenericMethod && 
-                            m.GetGenericArguments().Length == 2 && 
-                            m.GetParameters().Length == 2 && 
-                            m.GetParameters()[1].ParameterType == typeof(VeloxResolutionContext));
-
-            var mapperProp = typeof(VeloxResolutionContext).GetProperty("Mapper")!;
-            var mapperAccess = Expression.Property(contextParam, mapperProp);
-
-            Expression currentElse = mapExpr;
-
-            // Derived tipleri en derindekinden başlayarak sırala (ToyPoodle -> Dog -> Animal)
-            var sortedDerivedTypes = registration.IncludedDerivedTypes
-                .OrderBy(t => GetInheritanceDepth(t.DerivedSource))
-                .Reverse()
-                .ToList();
-
-            foreach (var (derivedSource, derivedDest) in sortedDerivedTypes)
-            {
-                if (sourceExpr.Type.IsAssignableFrom(derivedSource) || derivedSource.IsAssignableFrom(sourceExpr.Type))
-                {
-                    var isTypeExpr = Expression.TypeIs(sourceExpr, derivedSource);
-                    
-                    var mapMethodGeneric = mapMethod.MakeGenericMethod(derivedSource, derivedDest);
-                    var castedSource = Expression.Convert(sourceExpr, derivedSource);
-                    var callMap = Expression.Call(mapperAccess, mapMethodGeneric, castedSource, contextParam);
-                    
-                    var convertedCall = Expression.Convert(callMap, destination);
-                    
-                    currentElse = Expression.Condition(isTypeExpr, convertedCall, currentElse);
-                }
-            }
-            
-            mapExpr = currentElse;
-        }
-
-        // En dış sarmalayıcı (MaxDepth ve PreserveReferences)
-        if (registration != null && contextParam != null && mode != MappingMode.ProjectTo)
-        {
-            var expressions = new List<Expression>();
-            var variables = new List<ParameterExpression>();
-
-            var resultVar = Expression.Variable(destination, "result");
-            variables.Add(resultVar);
-
-            Expression? preserveReferencesCheck = null;
-            Expression? maxDepthCheck = null;
-            Expression mainMappingFlow = mapExpr;
-            LabelTarget? returnTarget = null;
-
-            // 1. PreserveReferences Giriş Kontrolü
-            if (registration.PreserveReferences)
-            {
-                var referenceCacheProp = typeof(VeloxResolutionContext).GetProperty("ReferenceCache", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!;
-                var cacheAccess = Expression.Property(contextParam, referenceCacheProp);
-
-                var tryGetValueMethod = typeof(VeloxReferenceCache).GetMethod("TryGetValue", new[] { typeof(object), typeof(object).MakeByRefType() })!;
-                var cachedVar = Expression.Variable(typeof(object), "cachedVal");
-                variables.Add(cachedVar);
-
-                var tryGetValueCall = Expression.Call(cacheAccess, tryGetValueMethod, Expression.Convert(sourceExpr, typeof(object)), cachedVar);
-
-                var cacheCheckCondition = Expression.AndAlso(
-                    Expression.NotEqual(cacheAccess, Expression.Constant(null, typeof(VeloxReferenceCache))),
-                    tryGetValueCall
-                );
-
-                returnTarget = Expression.Label();
-                preserveReferencesCheck = Expression.IfThen(
-                    cacheCheckCondition,
-                    Expression.Block(
-                        Expression.Assign(resultVar, Expression.Convert(cachedVar, destination)),
-                        Expression.Return(returnTarget) // early return
-                    )
-                );
-            }
-
-            // 2. MaxDepth Giriş Kontrolü ve Derinlik Yönetimi
-            if (registration.MaxDepth > 0)
-            {
-                var currentDepthProp = typeof(VeloxResolutionContext).GetProperty("CurrentDepth", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!;
-                var depthAccess = Expression.Property(contextParam, currentDepthProp);
-                var maxDepthConst = Expression.Constant(registration.MaxDepth);
-
-                var depthCheck = Expression.GreaterThanOrEqual(depthAccess, maxDepthConst);
-
-                var incrementDepth = Expression.Assign(depthAccess, Expression.Add(depthAccess, Expression.Constant(1)));
-                var decrementDepth = Expression.Assign(depthAccess, Expression.Subtract(depthAccess, Expression.Constant(1)));
-
-                var tryFinally = Expression.TryFinally(
-                    Expression.Assign(resultVar, mainMappingFlow),
-                    decrementDepth
-                );
-
-                maxDepthCheck = Expression.IfThenElse(
-                    depthCheck,
-                    Expression.Assign(resultVar, Expression.Default(destination)),
-                    Expression.Block(
-                        incrementDepth,
-                        tryFinally
-                    )
-                );
-
-                mainMappingFlow = maxDepthCheck;
-            }
-            else
-            {
-                mainMappingFlow = Expression.Assign(resultVar, mainMappingFlow);
-            }
-
-            if (preserveReferencesCheck != null)
-            {
-                var labelReturn = Expression.Label(returnTarget!);
-
-                var fullFlowBlock = Expression.Block(
-                    preserveReferencesCheck,
-                    mainMappingFlow,
-                    labelReturn
-                );
-
-                return Expression.Block(variables, fullFlowBlock, resultVar);
-            }
-            else if (registration.MaxDepth > 0)
-            {
-                return Expression.Block(variables, mainMappingFlow, resultVar);
-            }
-        }
-
-        return mapExpr;
+        return block;
     }
 
     /// <summary>
-    /// Bir hedef property veya constructor parametresi için kaynak expression çözümler.
-    /// Öncelik sırası: ForMember MapFrom → isim eşleştirme → flattening
+    /// Koşul delegesinin üçüncü parametresi için değer: tür uyuyorsa çözülen kaynak değer, aksi halde eşlenmiş değer.
     /// </summary>
-    private static Expression? ResolvePropertyExpression(
-        Expression sourceExpr,
-        PropertyInfo[] sourceProps,
-        Type sourceType,
-        string destName,
-        Type destType,
-        MappingRegistration? registration,
-        MapperConfiguration config,
-        ParameterExpression? contextParam,
-        string? profileName,
-        MappingMode mode,
-        Expression? destExpr = null)
+    private static Expression ConditionValueArgument(Expression raw, Expression mapped, Type parameterType)
     {
-        // 1. ForMember MapFrom kontrolü
-        if (registration != null &&
-            registration.MemberRules.TryGetValue(destName, out var rule) &&
-            rule.MapFromExpression != null)
-        {
-            // MapFrom lambda'sının parametresini sourceExpr ile değiştir
-            var mapFromLambda = rule.MapFromExpression;
-            var body = new ParameterReplacer(mapFromLambda.Parameters[0], sourceExpr)
-                .Visit(mapFromLambda.Body);
-
-            body = MakeNullSafe(body);
-
-            // Tip uyumluluğu — gerekirse dönüşüm ekle
-            if (body.Type != destType && destType.IsAssignableFrom(body.Type))
-                return body;
-            if (body.Type != destType)
-                return Expression.Convert(body, destType);
-            return body;
-        }
-
-        // 2. İsimle eşleşen kaynak property (prefix, postfix, naming convention destekli)
-        var srcProp = sourceProps.FirstOrDefault(x =>
-            NameMatchingHelper.IsMatch(x.Name, destName, config));
-
-        if (srcProp != null && srcProp.CanRead)
-        {
-            var propAccess = Expression.Property(sourceExpr, srcProp);
-            var safePropAccess = MakeNullSafe(propAccess);
-            return BuildPropertyAssignment(safePropAccess, srcProp.PropertyType, destType, config, contextParam, profileName, mode);
-        }
-
-        // 2b. İsimle eşleşen kaynak field
-        var sourceFields = sourceType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(config.ShouldMapField)
-            .ToArray();
-        var srcField = sourceFields.FirstOrDefault(x =>
-            NameMatchingHelper.IsMatch(x.Name, destName, config));
-
-        if (srcField != null)
-        {
-            var fieldAccess = Expression.Field(sourceExpr, srcField);
-            var safeFieldAccess = MakeNullSafe(fieldAccess);
-            return BuildPropertyAssignment(safeFieldAccess, srcField.FieldType, destType, config, contextParam, profileName, mode);
-        }
-
-        // 3. Flattening denemesi (AddressCity → Address.City)
-        var flattenExpr = FlatteningHelper.TryResolveFlattening(sourceExpr, sourceType, destName, config);
-        if (flattenExpr != null)
-        {
-            var safeFlattenExpr = MakeNullSafe(flattenExpr);
-            return BuildPropertyAssignment(safeFlattenExpr, flattenExpr.Type, destType, config, contextParam, profileName, mode);
-        }
-
-        return null;
+        if (parameterType == typeof(object)) return Expression.Convert(raw, typeof(object));
+        if (parameterType.IsAssignableFrom(raw.Type)) return ExpressionUtil.Coerce(raw, parameterType);
+        return ExpressionUtil.Coerce(mapped, parameterType);
     }
 
     /// <summary>
-    /// Property atamasını resolver, condition, pre-condition ve null-substitute kurallarını uygulayarak oluşturur.
+    /// Kural (resolver, converter, MapFrom) veya konvansiyonla hedef üye için ham kaynak değeri çözer.
     /// </summary>
-    private static Expression? BuildPropertyExpressionWithRules(
-        Expression sourceExpr,
-        Expression destVar,
-        PropertyInfo[] sourceProps,
-        Type sourceType,
-        string destName,
-        Type destType,
-        MappingRegistration? registration,
-        MapperConfiguration config,
-        ParameterExpression? contextParam,
-        MappingMode mode,
-        MemberMappingRule? customRule = null,
-        Expression? assignTarget = null)
+    private static Expression? ResolveRawValue(Expression source, Expression dest, Expression destinationAccess, string memberName,
+        MemberMappingRule? rule, MappingRegistration? registration, BuildScope scope, ProfileMap profile)
     {
-        var target = assignTarget ?? destVar;
-        Expression destPropAccess;
-        var pInfo = target.Type.GetProperty(destName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-        if (pInfo != null)
-            destPropAccess = Expression.Property(target, pInfo);
-        else
-        {
-            var fInfo = target.Type.GetField(destName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (fInfo != null)
-                destPropAccess = Expression.Field(target, fInfo);
-            else
-                destPropAccess = Expression.Property(target, destName);
-        }
-        MemberMappingRule? rule = customRule;
-        if (rule == null)
-        {
-            registration?.MemberRules.TryGetValue(destName, out rule);
-        }
+        var context = scope.Context;
+        var currentValue = IsReadable(destinationAccess) ? destinationAccess : Expression.Default(destinationAccess.Type);
 
-        // Değer Çözümleme
-        Expression? resolvedValueExpr = null;
-
-        if (rule != null)
+        if (rule != null && !scope.IsProjection && context != null)
         {
-            if (rule.ResolverType != null && contextParam != null)
+            if (rule.ResolverInstance != null || rule.ResolverType != null)
             {
-                var resolveServiceMethod = typeof(ExpressionBuilder).GetMethod(nameof(ResolveService))!;
-                var resolverInstanceExpr = Expression.Convert(
-                    Expression.Call(resolveServiceMethod, contextParam, Expression.Constant(rule.ResolverType)),
-                    rule.ResolverType
-                );
-                var resolveMethod = rule.ResolverType.GetMethod("Resolve")!;
-                var destValExpr = destPropAccess;
-                resolvedValueExpr = Expression.Call(resolverInstanceExpr, resolveMethod, sourceExpr, destVar, destValExpr, contextParam);
+                var resolverType = rule.ResolverInstance?.GetType() ?? rule.ResolverType!;
+                if (resolverType.IsGenericTypeDefinition) resolverType = CloseGeneric(resolverType, source.Type, dest.Type);
+                var iface = ExtensibilityTypes.FindInterface(resolverType, ExtensibilityTypes.ValueResolvers,
+                                args => args[0].IsAssignableFrom(source.Type) && args[1].IsAssignableFrom(dest.Type))
+                            ?? throw new VeloxConfigurationException($"'{resolverType.FullName}', {source.Type.Name} -> {dest.Type.Name} için uygun bir IValueResolver<,,> uygulamıyor.");
+                var instance = ServiceInstance(rule.ResolverInstance, resolverType, iface, context);
+                var args = iface.GetGenericArguments();
+                return Expression.Call(instance, iface.GetMethod("Resolve")!,
+                    ExpressionUtil.Coerce(source, args[0]), ExpressionUtil.Coerce(dest, args[1]), CoerceValue(currentValue, args[2]), context);
             }
-            else if (rule.MemberValueResolverType != null && contextParam != null)
+
+            if (rule.MemberValueResolverInstance != null || rule.MemberValueResolverType != null)
             {
-                var resolveServiceMethod = typeof(ExpressionBuilder).GetMethod(nameof(ResolveService))!;
-                var resolverInstanceExpr = Expression.Convert(
-                    Expression.Call(resolveServiceMethod, contextParam, Expression.Constant(rule.MemberValueResolverType)),
-                    rule.MemberValueResolverType
-                );
-
-                var sourceMemberLambda = rule.SourceMemberForResolver!;
-                var sourceMemberVal = new ParameterReplacer(sourceMemberLambda.Parameters[0], sourceExpr)
-                    .Visit(sourceMemberLambda.Body);
-                sourceMemberVal = MakeNullSafe(sourceMemberVal);
-
-                var resolveMethod = rule.MemberValueResolverType.GetMethod("Resolve")!;
-                var destValExpr = destPropAccess;
-                resolvedValueExpr = Expression.Call(resolverInstanceExpr, resolveMethod, sourceExpr, destVar, sourceMemberVal, destValExpr, contextParam);
+                var resolverType = rule.MemberValueResolverInstance?.GetType() ?? rule.MemberValueResolverType!;
+                var iface = ExtensibilityTypes.FindInterface(resolverType, ExtensibilityTypes.MemberValueResolvers,
+                                args => args[0].IsAssignableFrom(source.Type) && args[1].IsAssignableFrom(dest.Type))
+                            ?? throw new VeloxConfigurationException($"'{resolverType.FullName}', {source.Type.Name} -> {dest.Type.Name} için uygun bir IMemberValueResolver<,,,> uygulamıyor.");
+                var instance = ServiceInstance(rule.MemberValueResolverInstance, resolverType, iface, context);
+                var args = iface.GetGenericArguments();
+                var sourceMember = rule.SourceMemberForResolver != null
+                    ? NullSafe(ExpressionUtil.ReplaceParameter(rule.SourceMemberForResolver, source), scope, profile)
+                    : ConventionResolver.Resolve(source, memberName, profile, registration, scope.Config) ?? Expression.Default(args[2]);
+                var sourceMemberValue = MapValue(sourceMember, args[2], null, scope, profile, null, inlineTypeMap: false) ?? CoerceValue(sourceMember, args[2]);
+                return Expression.Call(instance, iface.GetMethod("Resolve")!,
+                    ExpressionUtil.Coerce(source, args[0]), ExpressionUtil.Coerce(dest, args[1]), ExpressionUtil.Coerce(sourceMemberValue, args[2]), CoerceValue(currentValue, args[3]), context);
             }
-            else if ((rule.ValueConverterType != null || rule.ValueConverter != null) && contextParam != null)
+
+            if (rule.HasValueConverter)
             {
-                var resolveServiceMethod = typeof(ExpressionBuilder).GetMethod(nameof(ResolveService))!;
-                Expression converterInstanceExpr;
-                Type converterType;
-                if (rule.ValueConverterType != null)
+                var converterType = rule.ValueConverter?.GetType() ?? rule.ValueConverterType!;
+                var sourceMember = rule.ValueConverterSourceMember != null
+                    ? NullSafe(ExpressionUtil.ReplaceParameter(rule.ValueConverterSourceMember, source), scope, profile)
+                    : ConventionResolver.Resolve(source, memberName, profile, registration, scope.Config);
+                if (sourceMember == null)
+                    throw new VeloxConfigurationException($"'{memberName}' için value converter kaynağı bulunamadı; ConvertUsing(converter, src => src.Member) kullanın.");
+                sourceMember = NullSafe(sourceMember, scope, profile);
+
+                var iface = ExtensibilityTypes.FindInterface(converterType, ExtensibilityTypes.ValueConverters, args => args[0].IsAssignableFrom(sourceMember.Type))
+                            ?? ExtensibilityTypes.FindInterface(converterType, ExtensibilityTypes.ValueConverters)
+                            ?? throw new VeloxConfigurationException($"'{converterType.FullName}' bir IValueConverter<,> uygulamıyor.");
+                var instance = ServiceInstance(rule.ValueConverter, converterType, iface, context);
+                var args = iface.GetGenericArguments();
+                var input = MapValue(sourceMember, args[0], null, scope, profile, null, inlineTypeMap: false) ?? CoerceValue(sourceMember, args[0]);
+                return Expression.Call(instance, iface.GetMethod("Convert")!, ExpressionUtil.Coerce(input, args[0]), context);
+            }
+
+            if (rule.MapFromFunc != null)
+            {
+                return rule.MapFromFuncArity switch
                 {
-                    converterType = rule.ValueConverterType;
-                    converterInstanceExpr = Expression.Convert(
-                        Expression.Call(resolveServiceMethod, contextParam, Expression.Constant(converterType)),
-                        converterType
-                    );
-                }
-                else
-                {
-                    converterType = rule.ValueConverter!.GetType();
-                    converterInstanceExpr = Expression.Convert(
-                        Expression.Call(resolveServiceMethod, contextParam, Expression.Constant(converterType)),
-                        converterType
-                    );
-                }
-
-                var converterSourceLambda = rule.ValueConverterSourceMember!;
-                var converterSourceVal = new ParameterReplacer(converterSourceLambda.Parameters[0], sourceExpr)
-                    .Visit(converterSourceLambda.Body);
-                converterSourceVal = MakeNullSafe(converterSourceVal);
-
-                var convertMethod = converterType.GetMethod("Convert")!;
-                resolvedValueExpr = Expression.Call(converterInstanceExpr, convertMethod, converterSourceVal, contextParam);
-            }
-            else if (rule.MapFromExpression != null)
-            {
-                var mapFromLambda = rule.MapFromExpression;
-                var body = new ParameterReplacer(mapFromLambda.Parameters[0], sourceExpr)
-                    .Visit(mapFromLambda.Body);
-
-                body = MakeNullSafe(body);
-
-                if (body.Type != destType)
-                    resolvedValueExpr = Expression.Convert(body, destType);
-                else
-                    resolvedValueExpr = body;
+                    2 => ExpressionUtil.InvokeDelegate(rule.MapFromFunc, source, dest),
+                    3 => ExpressionUtil.InvokeDelegate(rule.MapFromFunc, source, dest, currentValue),
+                    _ => ExpressionUtil.InvokeDelegate(rule.MapFromFunc, source, dest, currentValue, context)
+                };
             }
         }
 
-        // Eğer henüz çözümlenmediyse standart çözümleme yap
-        if (resolvedValueExpr == null)
+        if (rule?.MapFromExpression != null)
         {
-            var resolved = ResolvePropertyExpression(sourceExpr, sourceProps, sourceType, destName, destType, registration, config, contextParam, registration?.ProfileName, mode, destVar);
-            if (resolved == null) return null;
-            resolvedValueExpr = resolved;
+            return NullSafe(ExpressionUtil.ReplaceParameter(rule.MapFromExpression, source), scope, profile);
         }
 
-        // NullSubstitute kontrolü
-        if (rule != null && rule.HasNullSubstitute)
+        if (rule != null && rule.HasValueSource && scope.IsProjection)
         {
-            if (!resolvedValueExpr.Type.IsValueType || Nullable.GetUnderlyingType(resolvedValueExpr.Type) != null)
-            {
-                var substituteConst = Expression.Constant(rule.NullSubstituteValue, resolvedValueExpr.Type);
-                var isNullCheck = Expression.Equal(resolvedValueExpr, Expression.Constant(null, resolvedValueExpr.Type));
-                resolvedValueExpr = Expression.Condition(isNullCheck, substituteConst, resolvedValueExpr);
-            }
+            // Resolver/converter/fonksiyon kuralları sorguya çevrilemez; ProjectTo'da üye atlanır
+            scope.Config.DiagnosticsSink?.Log($"ProjectTo: '{memberName}' üyesi özel resolver/converter kullandığı için projeksiyona dahil edilmedi.", "Warning");
+            return null;
         }
 
-        // Atama ifadesi
-        Expression finalAssignExpr;
-        if (rule != null && rule.KeepDestinationValue && contextParam != null)
-        {
-            if (CollectionExpressionHelper.IsCollectionType(destType))
-            {
-                var srcElementType = CollectionExpressionHelper.GetCollectionElementType(resolvedValueExpr.Type);
-                var dstElementType = CollectionExpressionHelper.GetCollectionElementType(destType);
-
-                if (srcElementType != null && dstElementType != null)
-                {
-                    var mergeMethod = typeof(CollectionExpressionHelper).GetMethod(nameof(CollectionExpressionHelper.MergeCollections))!
-                        .MakeGenericMethod(srcElementType, dstElementType);
-                    
-                    var destCollectionType = typeof(ICollection<>).MakeGenericType(dstElementType);
-                    var castedDest = Expression.Convert(destPropAccess, destCollectionType);
-                    var mergeCall = Expression.Call(null, mergeMethod, resolvedValueExpr, castedDest, contextParam);
-                    
-                    finalAssignExpr = Expression.Block(
-                        Expression.IfThenElse(
-                            Expression.Equal(destPropAccess, Expression.Constant(null, destPropAccess.Type)),
-                            Expression.Assign(destPropAccess, resolvedValueExpr), // null ise normal atama
-                            mergeCall
-                        )
-                    );
-                }
-                else
-                {
-                    finalAssignExpr = Expression.Assign(destPropAccess, resolvedValueExpr);
-                }
-            }
-            else if (!destType.IsValueType && destType != typeof(string))
-            {
-                var mapperProp = typeof(VeloxResolutionContext).GetProperty("Mapper")!;
-                var mapperAccess = Expression.Property(contextParam, mapperProp);
-                var mapMethod = typeof(Mapper).GetMethod("Map", BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public, null, new[] { typeof(object), typeof(object), typeof(VeloxResolutionContext) }, null);
-                
-                if (mapMethod != null)
-                {
-                    var newDestExpr = Expression.New(destType);
-                    var destInstance = Expression.Variable(destType, "destInstance");
-                    var mapperConcrete = Expression.Convert(mapperAccess, typeof(Mapper));
-                    var callMap = Expression.Call(mapperConcrete, mapMethod, 
-                        Expression.Convert(resolvedValueExpr, typeof(object)), 
-                        Expression.Convert(destInstance, typeof(object)), 
-                        contextParam
-                    );
-                    
-                    finalAssignExpr = Expression.Block(
-                        new[] { destInstance },
-                        Expression.Assign(destInstance, Expression.Coalesce(destPropAccess, Expression.Convert(newDestExpr, destType))),
-                        Expression.IfThen(
-                            Expression.NotEqual(resolvedValueExpr, Expression.Constant(null, resolvedValueExpr.Type)),
-                            Expression.Block(
-                                callMap,
-                                Expression.Assign(destPropAccess, destInstance)
-                            )
-                        )
-                    );
-                }
-                else
-                {
-                    finalAssignExpr = Expression.Assign(destPropAccess, resolvedValueExpr);
-                }
-            }
-            else
-            {
-                finalAssignExpr = Expression.Assign(destPropAccess, resolvedValueExpr);
-            }
-        }
-        else
-        {
-            finalAssignExpr = Expression.Assign(destPropAccess, resolvedValueExpr);
-        }
-
-        if (contextParam != null)
-        {
-            var currentMemberProp = typeof(VeloxResolutionContext).GetProperty("CurrentMember")!;
-            var setCurrentMember = Expression.Assign(
-                Expression.Property(contextParam, currentMemberProp),
-                Expression.Constant(destName)
-            );
-            finalAssignExpr = Expression.Block(setCurrentMember, finalAssignExpr);
-        }
-
-        // Condition kontrolü
-        if (rule != null && rule.ConditionDelegate != null)
-        {
-            var condConst = Expression.Constant(rule.ConditionDelegate);
-            var tempVar = Expression.Variable(resolvedValueExpr.Type, "tempVal");
-            var assignToTemp = Expression.Assign(tempVar, resolvedValueExpr);
-
-            var invokeCondition = Expression.Invoke(condConst, sourceExpr, destVar, tempVar);
-            var ifCondition = Expression.IfThen(invokeCondition, Expression.Assign(destPropAccess, tempVar));
-
-            finalAssignExpr = Expression.Block(new[] { tempVar }, assignToTemp, ifCondition);
-        }
-        else if (registration?.ForAllMembersCondition != null)
-        {
-            var tempVar = Expression.Variable(resolvedValueExpr.Type, "tempVal");
-            var assignToTemp = Expression.Assign(tempVar, resolvedValueExpr);
-
-            var boxedSource = Expression.Convert(sourceExpr, typeof(object));
-            var boxedDest = Expression.Convert(destVar, typeof(object));
-            var boxedVal = Expression.Convert(tempVar, typeof(object));
-
-            var conditionExpr = Expression.Constant(registration.ForAllMembersCondition);
-            var invokeCondition = Expression.Invoke(conditionExpr, boxedSource, boxedDest, boxedVal);
-
-            var ifCondition = Expression.IfThen(invokeCondition, Expression.Assign(destPropAccess, tempVar));
-
-            finalAssignExpr = Expression.Block(new[] { tempVar }, assignToTemp, ifCondition);
-        }
-
-        // IgnoreNullValues kontrolü (yama modunda kaynak null ise hedefe yazmayı atla)
-        if (config.IgnoreNullValues && !resolvedValueExpr.Type.IsValueType && (rule == null || !rule.HasNullSubstitute))
-        {
-            var isNotNull = Expression.NotEqual(resolvedValueExpr, Expression.Constant(null, resolvedValueExpr.Type));
-            finalAssignExpr = Expression.IfThen(isNotNull, finalAssignExpr);
-        }
-
-        // PreCondition varsa saralım
-        if (rule != null && rule.PreConditionDelegate != null)
-        {
-            var preCondConst = Expression.Constant(rule.PreConditionDelegate);
-            var preConditionExpr = Expression.Invoke(preCondConst, sourceExpr);
-            return Expression.IfThen(preConditionExpr, finalAssignExpr);
-        }
-
-        return finalAssignExpr;
+        var convention = ConventionResolver.Resolve(source, memberName, profile, registration, scope.Config);
+        return convention == null ? null : NullSafe(convention, scope, profile);
     }
 
-    /// <summary>
-    /// Kaynak expression'ı hedef türe uygun hale getirir.
-    /// Doğrudan atama, enum dönüşümü, nullable wrap/unwrap veya rekürsif mapping yapar.
-    /// </summary>
-    private static Expression? BuildPropertyAssignment(
-        Expression sourceExpr, Type sourceType, Type destType, MapperConfiguration config, ParameterExpression? contextParam, string? profileName, MappingMode mode)
+    private static Expression ServiceInstance(object? instance, Type implementationType, Type interfaceType, ParameterExpression context)
     {
-        Expression? result = null;
+        if (instance != null) return Expression.Constant(instance, interfaceType);
+        return Expression.Convert(Expression.Call(ResolveServiceMethod, context, Expression.Constant(implementationType)), interfaceType);
+    }
 
-        // Doğrudan atanabilir (Koleksiyon değilse)
-        if (destType.IsAssignableFrom(sourceType) &&
-            !(CollectionExpressionHelper.IsCollectionType(sourceType) && CollectionExpressionHelper.IsCollectionType(destType)))
+    private static Type CloseGeneric(Type openType, Type sourceType, Type destinationType)
+    {
+        var args = sourceType.GetGenericArguments().Concat(destinationType.GetGenericArguments()).ToArray();
+        var arity = openType.GetGenericArguments().Length;
+        if (args.Length == arity) return openType.MakeGenericType(args);
+        if (sourceType.GetGenericArguments().Length == arity) return openType.MakeGenericType(sourceType.GetGenericArguments());
+        if (destinationType.GetGenericArguments().Length == arity) return openType.MakeGenericType(destinationType.GetGenericArguments());
+        throw new VeloxConfigurationException($"'{openType.FullName}' open generic türü {sourceType.Name} -> {destinationType.Name} için kapatılamadı.");
+    }
+
+    private static Expression CoerceValue(Expression value, Type type)
+    {
+        if (type.IsAssignableFrom(value.Type)) return ExpressionUtil.Coerce(value, type);
+        try
         {
-            var underlying = Nullable.GetUnderlyingType(destType);
-            if (underlying != null && underlying == sourceType)
-            {
-                result = Expression.Convert(sourceExpr, destType);
-            }
-            else
-            {
-                result = sourceExpr;
-            }
+            return Expression.Convert(value, type);
         }
-        // Koleksiyon → Koleksiyon
-        else if (CollectionExpressionHelper.IsCollectionType(sourceType) &&
-            CollectionExpressionHelper.IsCollectionType(destType))
+        catch (InvalidOperationException)
         {
-            var srcElem = CollectionExpressionHelper.GetCollectionElementType(sourceType);
-            var dstElem = CollectionExpressionHelper.GetCollectionElementType(destType);
-            if (srcElem != null && dstElem != null)
+            return Expression.Default(type);
+        }
+    }
+
+    private static Expression NullSafe(Expression expression, BuildScope scope, ProfileMap profile)
+    {
+        if (scope.IsProjection) return profile.EnableNullPropagationForQueryMapping ? NullSafetyVisitor.Apply(expression, forProjection: true) : expression;
+        return NullSafetyVisitor.Apply(expression);
+    }
+
+    private static Expression SubstituteConstant(object? value, Type memberType)
+    {
+        if (value == null) return Expression.Default(memberType);
+        if (memberType.IsInstanceOfType(value)) return Expression.Constant(value, memberType);
+
+        var target = Nullable.GetUnderlyingType(memberType) ?? memberType;
+        try
+        {
+            object converted = target.IsEnum
+                ? (value is string s ? Enum.Parse(target, s, true) : Enum.ToObject(target, value))
+                : target == typeof(string) ? value.ToString()! : System.Convert.ChangeType(value, target, System.Globalization.CultureInfo.InvariantCulture);
+            return Expression.Convert(Expression.Constant(converted, target), memberType);
+        }
+        catch (Exception ex) when (ex is InvalidCastException || ex is FormatException || ex is OverflowException || ex is ArgumentException)
+        {
+            throw new VeloxConfigurationException($"NullSubstitute değeri ('{value}') '{memberType.Name}' türüne dönüştürülemiyor.");
+        }
+    }
+
+    private static Expression ApplyTransformers(Expression value, Type memberType, MemberMappingRule? rule, MappingRegistration? registration, ProfileMap profile, bool forProjection = false)
+    {
+        IEnumerable<LambdaExpression> transformers = Enumerable.Empty<LambdaExpression>();
+        if (rule != null) transformers = transformers.Concat(rule.Transformers.Where(t => t.Parameters[0].Type.IsAssignableFrom(memberType)));
+        if (registration != null) transformers = transformers.Concat(registration.ValueTransformers.Where(t => t.Parameters[0].Type.IsAssignableFrom(memberType)));
+        if (profile.ProfileTransformers != null) transformers = transformers.Concat(profile.ProfileTransformers.GetTransformers(memberType));
+        if (profile.GlobalTransformers != null) transformers = transformers.Concat(profile.GlobalTransformers.GetTransformers(memberType));
+
+        foreach (var transformer in transformers)
+        {
+            var parameterType = transformer.Parameters[0].Type;
+            var input = ExpressionUtil.Coerce(value, parameterType);
+            Expression applied = ExpressionUtil.ReplaceParameter(transformer, input);
+
+            // Null değerler transformer'a gönderilmez (ör. string.Trim null'da hata vermesin)
+            if (ExpressionUtil.CanBeNull(parameterType) && forProjection)
             {
-                result = CollectionExpressionHelper.BuildCollectionMapping(
-                    sourceExpr, srcElem, dstElem, destType,
-                    e => BuildPropertyAssignment(e, srcElem, dstElem, config, contextParam, profileName, mode)
-                         ?? throw new VeloxMappingException($"Koleksiyon elemanı eşleştirilemedi: {srcElem.FullName} -> {dstElem.FullName}"),
-                    config.AllowNullCollections,
-                    mode);
+                // Sorgularda BlockExpression çevrilemez: değişken yerine koşullu ifade
+                applied = Expression.Condition(ExpressionUtil.IsNull(input), input, applied);
             }
-        }
-        // Enum dönüşümü
-        else if (TryBuildEnumConversion(sourceExpr, sourceType, destType) is Expression enumExpr)
-        {
-            result = enumExpr;
-        }
-        // Nullable dönüşümü
-        else if (TryBuildNullableConversion(sourceExpr, sourceType, destType, config, contextParam, profileName, mode) is Expression nullableExpr)
-        {
-            result = nullableExpr;
-        }
-        // Karmaşık tip — rekürsif mapping
-        else if (!sourceType.IsPrimitive && sourceType != typeof(string) &&
-            !destType.IsPrimitive && destType != typeof(string))
-        {
-            if (contextParam != null && mode != MappingMode.ProjectTo)
+            else if (ExpressionUtil.CanBeNull(parameterType))
             {
-                var mapperProp = typeof(VeloxResolutionContext).GetProperty("Mapper")!;
-                var mapperAccess = Expression.Property(contextParam, mapperProp);
-                
-                var mapMethod = typeof(IVeloxMapper).GetMethods()
-                    .First(m => m.Name == "Map" && 
-                                m.IsGenericMethod && 
-                                m.GetGenericArguments().Length == 2 && 
-                                m.GetParameters().Length == 2 && 
-                                m.GetParameters()[1].ParameterType == typeof(VeloxResolutionContext));
-                                
-                var mapMethodGeneric = mapMethod.MakeGenericMethod(sourceType, destType);
-                result = Expression.Call(mapperAccess, mapMethodGeneric, sourceExpr, contextParam);
+                var variable = Expression.Variable(parameterType, "transformed");
+                applied = Expression.Block(new[] { variable },
+                    Expression.Assign(variable, input),
+                    Expression.Condition(ExpressionUtil.IsNull(variable), variable, ExpressionUtil.ReplaceParameter(transformer, variable)));
             }
-            else
+
+            value = ExpressionUtil.Coerce(applied, memberType);
+        }
+
+        return value;
+    }
+
+    private static Expression? BuildForPath(Expression source, Expression dest, ForPathRule pathRule, MappingRegistration registration, BuildScope scope, ProfileMap profile)
+    {
+        if (pathRule.MemberRule.IsIgnored) return null;
+
+        var statements = new List<Expression>();
+        Expression current = dest;
+        for (var i = 0; i < pathRule.PathSegments.Length - 1; i++)
+        {
+            var member = FindMember(current.Type, pathRule.PathSegments[i])
+                ?? throw new VeloxConfigurationException($"ForPath: '{current.Type.FullName}' türünde '{pathRule.PathSegments[i]}' üyesi bulunamadı.");
+            var access = Expression.MakeMemberAccess(current, member);
+            var memberType = TypeMembers.GetMemberType(member);
+
+            if (!memberType.IsValueType && TypeMembers.CanWrite(member))
             {
-                result = BuildMapBody(sourceExpr, sourceType, destType, config, contextParam, mode);
-                
-                // Eğer in-memory çalışıyorsak (ProjectTo değilse) ve sourceExpr null olabiliyorsa,
-                // tüm haritalamayı null kontrolü ile sarmala: sourceExpr == null ? null : result
-                if (mode != MappingMode.ProjectTo && CanBeNull(sourceExpr.Type) && sourceExpr is not ParameterExpression)
+                var ctor = memberType.GetConstructor(Type.EmptyTypes);
+                if (ctor != null)
                 {
-                    var isNull = IsNullExpression(sourceExpr);
-                    result = Expression.Condition(isNull, Expression.Default(destType), result);
+                    statements.Add(Expression.IfThen(Expression.Equal(access, Expression.Constant(null, memberType)), Expression.Assign(access, Expression.New(ctor))));
                 }
             }
+
+            current = access;
         }
 
-        if (result != null)
-        {
-            result = ApplyValueTransformers(result, destType, config, profileName);
-        }
+        var leaf = FindMember(current.Type, pathRule.PathSegments[pathRule.PathSegments.Length - 1])
+            ?? throw new VeloxConfigurationException($"ForPath: '{current.Type.FullName}' türünde '{pathRule.PathSegments[pathRule.PathSegments.Length - 1]}' üyesi bulunamadı.");
+        if (!TypeMembers.CanWrite(leaf))
+            throw new VeloxConfigurationException($"ForPath: '{current.Type.FullName}.{leaf.Name}' üyesi yazılabilir değil.");
 
-        return result;
+        var assignment = BuildMemberAssignment(source, dest, leaf, pathRule.MemberRule, registration, scope, profile, current);
+        if (assignment == null) return null;
+        statements.Add(assignment);
+        return Expression.Block(statements);
     }
 
-    /// <summary>
-    /// Enum dönüşüm expression'ı üretmeye çalışır.
-    /// </summary>
-    private static Expression? TryBuildEnumConversion(Expression sourceExpr, Type srcType, Type destType)
+    private static MemberInfo? FindMember(Type type, string name)
+        => (MemberInfo?)type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+           ?? type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
+    private static bool IsReadable(MemberInfo member) => member is FieldInfo || (member is PropertyInfo p && p.GetMethod != null);
+
+    private static bool IsReadable(Expression access)
+        => access is not MemberExpression memberAccess || IsReadable(memberAccess.Member);
+
+    // ─── BeforeMap / AfterMap ───────────────────────────────────────────────
+
+    private static IEnumerable<Expression> BuildActions(IReadOnlyList<object> actions, Expression source, Expression dest, BuildScope scope)
     {
-        var srcUnderlying = Nullable.GetUnderlyingType(srcType) ?? srcType;
-        var dstUnderlying = Nullable.GetUnderlyingType(destType) ?? destType;
-
-        // Enum → Enum (farklı enum türleri — underlying value üzerinden cast)
-        if (srcUnderlying.IsEnum && dstUnderlying.IsEnum)
-        {
-            var actualSource = srcType != srcUnderlying
-                ? (Expression)Expression.Property(sourceExpr, "Value")
-                : sourceExpr;
-
-            var underlyingType = Enum.GetUnderlyingType(srcUnderlying);
-            var toUnderlying = Expression.Convert(actualSource, underlyingType);
-            var toDestEnum = Expression.Convert(toUnderlying, dstUnderlying);
-
-            return destType != dstUnderlying
-                ? Expression.Convert(toDestEnum, destType)
-                : toDestEnum;
-        }
-
-        // Enum → string (ToString)
-        if (srcUnderlying.IsEnum && dstUnderlying == typeof(string))
-        {
-            var actualSource = srcType != srcUnderlying
-                ? (Expression)Expression.Property(sourceExpr, "Value")
-                : sourceExpr;
-
-            var toStringMethod = srcUnderlying.GetMethod("ToString", Type.EmptyTypes)!;
-            return Expression.Call(actualSource, toStringMethod);
-        }
-
-        // string → Enum (Enum.Parse)
-        if (srcUnderlying == typeof(string) && dstUnderlying.IsEnum)
-        {
-            var parseMethod = typeof(Enum).GetMethod("Parse", new[] { typeof(Type), typeof(string), typeof(bool) })!;
-            var parsed = Expression.Call(null, parseMethod,
-                Expression.Constant(dstUnderlying),
-                sourceExpr,
-                Expression.Constant(true)); // case-insensitive
-
-            return Expression.Convert(parsed, destType);
-        }
-
-        // Enum → int / int → Enum (underlying type üzerinden cast)
-        if (srcUnderlying.IsEnum && dstUnderlying == Enum.GetUnderlyingType(srcUnderlying))
-        {
-            return Expression.Convert(sourceExpr, destType);
-        }
-        if (dstUnderlying.IsEnum && srcUnderlying == Enum.GetUnderlyingType(dstUnderlying))
-        {
-            return Expression.Convert(sourceExpr, destType);
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Nullable dönüşüm expression'ı üretmeye çalışır.
-    /// int → int?, int? → int (null kontrolü ile), T? → T? gibi dönüşümler.
-    /// </summary>
-    private static Expression? TryBuildNullableConversion(
-        Expression sourceExpr, Type srcType, Type destType, MapperConfiguration config, ParameterExpression? contextParam, string? profileName, MappingMode mode)
-    {
-        var srcUnderlying = Nullable.GetUnderlyingType(srcType);
-        var dstUnderlying = Nullable.GetUnderlyingType(destType);
-
-        // T → T? (non-nullable to nullable wrapper)
-        if (srcUnderlying == null && dstUnderlying != null && srcType == dstUnderlying)
-        {
-            return Expression.Convert(sourceExpr, destType);
-        }
-
-        // T? → T (nullable to non-nullable — Value property erişimi)
-        if (srcUnderlying != null && dstUnderlying == null && srcUnderlying == destType)
-        {
-            // source.HasValue ? source.Value : default(T)
-            var hasValue = Expression.Property(sourceExpr, "HasValue");
-            var value = Expression.Property(sourceExpr, "Value");
-            return Expression.Condition(hasValue, value, Expression.Default(destType));
-        }
-
-        // T? → U? (nullable to nullable, farklı underlying tür)
-        if (srcUnderlying != null && dstUnderlying != null && srcUnderlying != dstUnderlying)
-        {
-            var hasValue = Expression.Property(sourceExpr, "HasValue");
-            var value = Expression.Property(sourceExpr, "Value");
-
-            var convertedValue = BuildPropertyAssignment(value, srcUnderlying, dstUnderlying, config, contextParam, profileName, mode);
-            if (convertedValue != null)
-            {
-                var wrappedValue = Expression.Convert(convertedValue, destType);
-                return Expression.Condition(hasValue, wrappedValue, Expression.Default(destType));
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Constructor seçim algoritması:
-    /// 1. [VeloxConstructor] özniteliği olan kazanır
-    /// 2. Yoksa parametresiz kurucu varsa onu seç
-    /// 3. Yoksa en çok parametreye sahip olanı seç
-    /// 4. Birden fazla aday varsa VeloxAmbiguousConstructorException
-    /// </summary>
-    private static ConstructorInfo SelectConstructor(ConstructorInfo[] ctors, Type destination)
-    {
-        // [VeloxConstructor] kontrolü
-        var veloxCtors = ctors
-            .Where(c => c.GetCustomAttribute<VeloxConstructorAttribute>() != null)
-            .ToArray();
-
-        if (veloxCtors.Length == 1)
-            return veloxCtors[0];
-
-        if (veloxCtors.Length > 1)
-        {
-            throw new VeloxConfigurationException(
-                $"'{destination.FullName}' türünde birden fazla [VeloxConstructor] özniteliği bulundu. " +
-                $"Sadece bir kurucuya uygulanmalıdır.");
-        }
-
-        // Parametresiz kurucu varsa onu tercih et
-        var parameterless = ctors.FirstOrDefault(c => c.GetParameters().Length == 0);
-        if (parameterless != null)
-            return parameterless;
-
-        // En çok parametreye sahip kurucu
-        var maxParams = ctors.Max(c => c.GetParameters().Length);
-        var candidates = ctors.Where(c => c.GetParameters().Length == maxParams).ToArray();
-
-        if (candidates.Length > 1)
-            throw new VeloxAmbiguousConstructorException(destination);
-
-        return candidates[0];
-    }
-
-    /// <summary>
-    /// Patch (yama) modu için kaynak değerleri var olan hedef nesne üzerine yazar.
-    /// </summary>
-    private static Expression BuildPatchBody(
-        Expression sourceExpr, Expression destExpr,
-        Type source, Type destination,
-        MapperConfiguration config,
-        ParameterExpression? contextParam)
-    {
-        var registration = config.GetRegistration(source, destination);
-
-        // Eğer tüm üyeler yoksayılacaksa hiçbir atama yapma
-        if (registration != null && registration.ForAllMembersIgnored)
-        {
-            return Expression.Empty();
-        }
-
-        var sourceProps = source.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(p => p.CanRead && config.ShouldMapProperty(p))
-            .ToArray();
-        var destProps = destination.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(p => p.CanWrite && config.ShouldMapProperty(p))
-            .OrderBy(p => registration != null && registration.MemberRules.TryGetValue(p.Name, out var r) ? r.MappingOrder : 0)
-            .ToArray();
-
-        var expressions = new List<Expression>();
-
-        // BeforeMap eylemleri eklenir
-        if (registration != null && registration.BeforeMapActions.Count > 0 && contextParam != null)
-        {
-            var beforeMapExprs = BuildMappingActionsExpressions(
-                registration.BeforeMapActions, sourceExpr, destExpr, contextParam, source, destination);
-            expressions.AddRange(beforeMapExprs);
-        }
-
-        foreach (var destProp in destProps)
-        {
-            // Global ignore edilmişse atla
-            if (config.GlobalIgnores.Contains(destProp.Name))
-                continue;
-
-            // Ignore edilmiş property'leri atla
-            if (registration != null &&
-                registration.MemberRules.TryGetValue(destProp.Name, out var ignoreRule) &&
-                (ignoreRule.IsIgnored || ignoreRule.IsDoNotValidate))
-                continue;
-
-            var assignExpr = BuildPropertyExpressionWithRules(
-                sourceExpr, destExpr, sourceProps.ToArray(), source, destProp.Name, destProp.PropertyType, registration, config, contextParam, MappingMode.Patch);
-
-            if (assignExpr != null)
-            {
-                expressions.Add(assignExpr);
-            }
-        }
-
-        var destFields = destination.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(f => !f.IsInitOnly && config.ShouldMapField(f))
-            .OrderBy(f => registration != null && registration.MemberRules.TryGetValue(f.Name, out var r) ? r.MappingOrder : 0)
-            .ToArray();
-
-        foreach (var destField in destFields)
-        {
-            if (config.GlobalIgnores.Contains(destField.Name))
-                continue;
-
-            if (registration != null &&
-                registration.MemberRules.TryGetValue(destField.Name, out var ignoreRule) &&
-                (ignoreRule.IsIgnored || ignoreRule.IsDoNotValidate))
-                continue;
-
-            var assignExpr = BuildPropertyExpressionWithRules(
-                sourceExpr, destExpr, sourceProps.ToArray(), source, destField.Name, destField.FieldType, registration, config, contextParam, MappingMode.Patch);
-
-            if (assignExpr != null)
-            {
-                expressions.Add(assignExpr);
-            }
-        }
-
-        // AfterMap eylemleri eklenir
-        if (registration != null && registration.AfterMapActions.Count > 0 && contextParam != null)
-        {
-            var afterMapExprs = BuildMappingActionsExpressions(
-                registration.AfterMapActions, sourceExpr, destExpr, contextParam, source, destination);
-            expressions.AddRange(afterMapExprs);
-        }
-
-        return expressions.Count == 0
-            ? Expression.Empty()
-            : Expression.Block(expressions);
-    }
-
-    /// <summary>
-    /// BeforeMap ve AfterMap eylemlerini çalıştıracak Expression listesini oluşturur.
-    /// </summary>
-    private static List<Expression> BuildMappingActionsExpressions(
-        IReadOnlyList<object> actions,
-        Expression sourceExpr,
-        Expression destExpr,
-        ParameterExpression contextParam,
-        Type sourceType,
-        Type destType)
-    {
-        var list = new List<Expression>();
+        var context = scope.Context!;
         foreach (var action in actions)
         {
             if (action is Type actionType)
             {
-                var resolveServiceMethod = typeof(ExpressionBuilder).GetMethod(nameof(ResolveService))!;
-                var mappingActionType = typeof(IVeloxMappingAction<,>).MakeGenericType(sourceType, destType);
-                
-                var actionInstanceExpr = Expression.Convert(
-                    Expression.Call(resolveServiceMethod, contextParam, Expression.Constant(actionType)),
-                    mappingActionType
-                );
-                
-                var processMethod = mappingActionType.GetMethod("Process")!;
-                var callExpr = Expression.Call(actionInstanceExpr, processMethod, sourceExpr, destExpr, contextParam);
-                list.Add(callExpr);
+                var iface = ExtensibilityTypes.FindInterface(actionType, ExtensibilityTypes.MappingActions,
+                                args => args[0].IsAssignableFrom(source.Type) && args[1].IsAssignableFrom(dest.Type))
+                            ?? throw new VeloxConfigurationException($"'{actionType.FullName}', {source.Type.Name} -> {dest.Type.Name} için uygun bir IMappingAction<,> uygulamıyor.");
+                var args = iface.GetGenericArguments();
+                var instance = Expression.Convert(Expression.Call(ResolveServiceMethod, context, Expression.Constant(actionType)), iface);
+                yield return Expression.Call(instance, iface.GetMethod("Process")!, ExpressionUtil.Coerce(source, args[0]), ExpressionUtil.Coerce(dest, args[1]), context);
             }
-            else if (action is Delegate inlineAction)
+            else if (action is Delegate inline)
             {
-                var invokeExpr = Expression.Invoke(Expression.Constant(inlineAction), sourceExpr, destExpr);
-                list.Add(invokeExpr);
+                yield return ExpressionUtil.Arity(inline) >= 3
+                    ? ExpressionUtil.InvokeDelegate(inline, source, dest, context)
+                    : ExpressionUtil.InvokeDelegate(inline, source, dest);
             }
         }
-        return list;
     }
 
-    /// <summary>
-    /// Lambda expression parametresini başka bir expression ile değiştiren ziyaretçi.
-    /// ForMember MapFrom lambda'larında kullanılır.
-    /// </summary>
-    private sealed class ParameterReplacer : ExpressionVisitor
+    // ─── Tip dönüştürücüler ─────────────────────────────────────────────────
+
+    private static Expression BuildConverterCall(Expression source, MappingRegistration registration, Type destinationType, Expression? existing, BuildScope scope)
     {
-        private readonly ParameterExpression _oldParam;
-        private readonly Expression _newExpr;
+        var context = scope.Context;
+        var existingValue = existing != null ? ExpressionUtil.Coerce(existing, destinationType) : Expression.Default(destinationType);
 
-        public ParameterReplacer(ParameterExpression oldParam, Expression newExpr)
+        if (registration.ConvertUsingExpression != null)
         {
-            _oldParam = oldParam;
-            _newExpr = newExpr;
+            return ExpressionUtil.Coerce(ExpressionUtil.ReplaceParameter(registration.ConvertUsingExpression, source), destinationType);
         }
 
-        protected override Expression VisitParameter(ParameterExpression node)
+        if (scope.IsProjection || context == null)
         {
-            return node == _oldParam ? _newExpr : base.VisitParameter(node);
+            throw new VeloxProjectionException(
+                $"{source.Type.Name} -> {destinationType.Name}: ProjectTo yalnızca ifade tabanlı ConvertUsing(src => ...) dönüştürücülerini destekler. " +
+                "ITypeConverter veya fonksiyon tabanlı dönüştürücüler sorguya çevrilemez.");
         }
+
+        if (registration.ConvertUsingFunc != null)
+        {
+            var func = registration.ConvertUsingFunc;
+            var call = ExpressionUtil.Arity(func) >= 3
+                ? ExpressionUtil.InvokeDelegate(func, source, existingValue, context)
+                : ExpressionUtil.InvokeDelegate(func, source, existingValue);
+            return ExpressionUtil.Coerce(call, destinationType);
+        }
+
+        var converterType = registration.CustomConverter?.GetType() ?? registration.CustomConverterType!;
+        if (converterType.IsGenericTypeDefinition) converterType = CloseGeneric(converterType, source.Type, destinationType);
+
+        var typeConverter = ExtensibilityTypes.FindInterface(converterType, new[] { typeof(ITypeConverter<,>) },
+            args => args[0].IsAssignableFrom(source.Type) && args[1].IsAssignableFrom(destinationType) || args[1] == destinationType);
+        if (typeConverter != null)
+        {
+            var args = typeConverter.GetGenericArguments();
+            var instance = ServiceInstance(registration.CustomConverter, converterType, typeConverter, context);
+            var call = Expression.Call(instance, typeConverter.GetMethod("Convert")!,
+                ExpressionUtil.Coerce(source, args[0]), CoerceValue(existingValue, args[1]), context);
+            return ExpressionUtil.Coerce(call, destinationType);
+        }
+
+        var veloxConverter = ExtensibilityTypes.FindInterface(converterType, new[] { typeof(IVeloxTypeConverter<,>) })
+            ?? throw new VeloxConfigurationException($"'{converterType.FullName}' bir ITypeConverter<,> uygulamıyor.");
+        var veloxArgs = veloxConverter.GetGenericArguments();
+        var veloxInstance = ServiceInstance(registration.CustomConverter, converterType, veloxConverter, context);
+        return ExpressionUtil.Coerce(Expression.Call(veloxInstance, veloxConverter.GetMethod("Convert")!, ExpressionUtil.Coerce(source, veloxArgs[0])), destinationType);
     }
 
-    /// <summary>
-    /// Tipin kalıtım derinliğini hesaplar. Hiyerarşide en alttaki (derived) tipi en önce kontrol etmek için kullanılır.
-    /// </summary>
-    private static int GetInheritanceDepth(Type type)
-    {
-        int depth = 0;
-        var parent = type.BaseType;
-        while (parent != null)
-        {
-            depth++;
-            parent = parent.BaseType;
-        }
-        return depth;
-    }
+    // ─── Koleksiyonlar ──────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Değere uygun value transformer'ları (varsa) uygular.
-    /// Önce profile düzeyindeki transformer'lar, yoksa global düzeydeki transformer'lar kontrol edilir.
-    /// </summary>
-    private static Expression ApplyValueTransformers(Expression expr, Type targetType, MapperConfiguration config, string? profileName)
+    private static Expression? BuildCollection(Expression value, Type destinationType, Expression? existing, BuildScope scope, ProfileMap profile, bool? allowNull)
     {
-        Delegate? transformer = null;
+        var sourceElement = CollectionExpressionHelper.GetCollectionElementType(value.Type)!;
+        var destinationElement = CollectionExpressionHelper.GetCollectionElementType(destinationType)!;
 
-        // 1. Profil düzeyindeki transformer'ları kontrol et
-        if (profileName != null && config.ProfileValueTransformers.TryGetValue(profileName, out var profileCollection))
+        var element = Expression.Parameter(sourceElement, "item");
+        var elementBody = MapValue(element, destinationElement, null, scope, profile, null, inlineTypeMap: false);
+        if (elementBody == null) return null;
+
+        if (scope.IsProjection)
         {
-            transformer = profileCollection.GetTransformer(targetType);
+            var projectionMap = Expression.Lambda(ExpressionUtil.Coerce(elementBody, destinationElement), element);
+            return CollectionExpressionHelper.BuildNewCollection(value, sourceElement, destinationElement, destinationType, projectionMap, forProjection: true)
+                   ?? throw new VeloxConfigurationException($"'{destinationType.FullName}' koleksiyon türü projeksiyonda oluşturulamıyor; List<T>, T[] veya IEnumerable<T> kullanın.");
         }
 
-        // 2. Profil düzeyinde yoksa global transformer'ları kontrol et
-        if (transformer == null)
+        // Kaynak bir kez değerlendirilir (null kontrolü, sayım ve döngü aynı değişkeni kullanır)
+        var source = Expression.Variable(value.Type, "sourceCollection");
+        var created = CollectionExpressionHelper.BuildLoopCollection(source, sourceElement, destinationElement, destinationType,
+                          item => ExpressionUtil.Coerce(MapValue(item, destinationElement, null, scope, profile, null, inlineTypeMap: false)!, destinationElement))
+                      ?? CollectionExpressionHelper.BuildNewCollection(source, sourceElement, destinationElement, destinationType,
+                          Expression.Lambda(ExpressionUtil.Coerce(elementBody, destinationElement), element), forProjection: false)
+                      ?? throw new VeloxConfigurationException($"'{destinationType.FullName}' koleksiyon türü oluşturulamıyor; List<T>, T[], HashSet<T> veya parametresiz kurucusu olan bir ICollection<T> kullanın.");
+
+        Expression mapped = existing != null && (TypeMembers.IsMutableCollectionType(destinationType) || destinationType.IsInterface)
+            ? CollectionExpressionHelper.BuildFillExisting(existing, source, sourceElement, destinationElement,
+                Expression.Lambda(ExpressionUtil.Coerce(elementBody, destinationElement), element), ExpressionUtil.Coerce(created, existing.Type))
+            : created;
+
+        var allowNullCollections = allowNull ?? profile.AllowNullCollections;
+        Expression whenNull;
+        if (allowNullCollections)
         {
-            transformer = config.GlobalValueTransformers.GetTransformer(targetType);
-        }
-
-        // 3. Eğer transformer varsa, invoke et
-        if (transformer != null)
-        {
-            var transformerConst = Expression.Constant(transformer);
-            return Expression.Invoke(transformerConst, expr);
-        }
-
-        return expr;
-    }
-
-    /// <summary>
-    /// ForPath kuralları için derin nesne grafiklerinde null kontrolleri yaparak atama ifadelerini oluşturur.
-    /// </summary>
-    private static List<Expression> BuildForPathExpressions(
-        IReadOnlyList<ForPathRule> forPathRules,
-        Expression sourceExpr,
-        Expression destVar,
-        MapperConfiguration config,
-        ParameterExpression? contextParam,
-        string? profileName,
-        MappingMode mode)
-    {
-        var expressions = new List<Expression>();
-
-        foreach (var rule in forPathRules)
-        {
-            var segments = rule.PathSegments;
-            if (segments == null || segments.Length == 0) continue;
-
-            // Zinciri oluştururken her adımda null kontrolü ve nesne oluşturma yapacağız.
-            var stepExprs = new List<Expression>();
-            Expression currentTarget = destVar;
-
-            for (int i = 0; i < segments.Length - 1; i++)
-            {
-                var segment = segments[i];
-                var prop = currentTarget.Type.GetProperty(segment, BindingFlags.Public | BindingFlags.Instance);
-                if (prop == null || !prop.CanRead)
-                {
-                    throw new VeloxConfigurationException(
-                        $"'{currentTarget.Type.FullName}' türü üzerinde '{segment}' adında okunabilir bir property bulunamadı.");
-                }
-
-                var propAccess = Expression.Property(currentTarget, prop);
-                
-                // Eğer bu alt nesne null ise, onu initialize et: if (currentTarget.Prop == null) currentTarget.Prop = new PropType();
-                if (!prop.PropertyType.IsValueType)
-                {
-                    var ctor = prop.PropertyType.GetConstructor(Type.EmptyTypes);
-                    if (ctor == null && prop.PropertyType != typeof(string))
-                    {
-                        throw new VeloxConfigurationException(
-                            $"'{prop.PropertyType.FullName}' türü için parametresiz kurucu bulunamadı. ForPath ile otomatik nesne oluşturulabilmesi için parametresiz kurucu gereklidir.");
-                    }
-
-                    if (prop.CanWrite)
-                    {
-                        var isNull = Expression.Equal(propAccess, Expression.Constant(null, prop.PropertyType));
-                        var createInstance = Expression.New(prop.PropertyType);
-                        var assignNew = Expression.Assign(propAccess, createInstance);
-                        var ifNullThenAssign = Expression.IfThen(isNull, assignNew);
-                        stepExprs.Add(ifNullThenAssign);
-                    }
-                }
-
-                currentTarget = propAccess;
-            }
-
-            // Son segment, yani değerin atanacağı yaprak property
-            var leafSegment = segments[segments.Length - 1];
-            var leafProp = currentTarget.Type.GetProperty(leafSegment, BindingFlags.Public | BindingFlags.Instance);
-            if (leafProp == null || !leafProp.CanWrite)
-            {
-                throw new VeloxConfigurationException(
-                    $"'{currentTarget.Type.FullName}' türü üzerinde '{leafSegment}' adında yazılabilir bir property bulunamadı.");
-            }
-
-            // Değeri MemberMappingRule kurallarına göre çöz
-            var leafSourceProps = sourceExpr.Type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                .Where(config.ShouldMapProperty)
-                .ToArray();
-            
-            // registration'ı da alalım
-            var registration = config.GetRegistration(sourceExpr.Type, destVar.Type);
-
-            var assignLeafExpr = BuildPropertyExpressionWithRules(
-                sourceExpr,
-                destVar,
-                leafSourceProps,
-                sourceExpr.Type,
-                leafProp.Name,
-                leafProp.PropertyType,
-                registration,
-                config,
-                contextParam,
-                mode,
-                rule.MemberRule,
-                currentTarget);
-
-            if (assignLeafExpr != null)
-            {
-                stepExprs.Add(assignLeafExpr);
-            }
-
-            // Tüm adımları tek bir blok olarak ekle
-            expressions.Add(Expression.Block(stepExprs));
-        }
-
-        return expressions;
-    }
-
-    /// <summary>
-    /// Belirtilen tipin null değer alıp alamayacağını kontrol eder.
-    /// </summary>
-    private static bool CanBeNull(Type type)
-    {
-        return !type.IsValueType || Nullable.GetUnderlyingType(type) != null;
-    }
-
-    /// <summary>
-    /// Nullable veya referans tipli expression'lar için null kontrol expression'ı üretir.
-    /// </summary>
-    private static Expression IsNullExpression(Expression step)
-    {
-        if (Nullable.GetUnderlyingType(step.Type) != null)
-        {
-            // Nullable<T> için !step.HasValue kontrolü
-            return Expression.Not(Expression.Property(step, "HasValue"));
+            whenNull = Expression.Constant(null, destinationType);
         }
         else
         {
-            // Referans tipleri için step == null kontrolü
-            return Expression.Equal(step, Expression.Constant(null, step.Type));
+            var empty = CollectionExpressionHelper.CreateEmptyCollection(destinationType);
+            whenNull = empty == null
+                ? Expression.Constant(null, destinationType)
+                : NewEmptyCollection(destinationType, destinationElement);
         }
+
+        return Expression.Block(destinationType, new[] { source },
+            Expression.Assign(source, value),
+            Expression.Condition(ExpressionUtil.IsNull(source), whenNull, ExpressionUtil.Coerce(mapped, destinationType)));
     }
+
+    private static Expression NewEmptyCollection(Type destinationType, Type elementType)
+    {
+        if (destinationType.IsArray) return Expression.NewArrayBounds(elementType, Expression.Constant(0));
+        var listType = typeof(List<>).MakeGenericType(elementType);
+        if (destinationType.IsAssignableFrom(listType)) return Expression.Convert(Expression.New(listType), destinationType);
+        var hashSetType = typeof(HashSet<>).MakeGenericType(elementType);
+        if (destinationType.IsAssignableFrom(hashSetType)) return Expression.Convert(Expression.New(hashSetType), destinationType);
+        return Expression.New(destinationType);
+    }
+
+    private static Expression? BuildDictionary(Expression value, Type sourceKey, Type sourceValue, Type destinationType, Type destinationKey, Type destinationValue,
+        Expression? existing, BuildScope scope, ProfileMap profile, bool? allowNull)
+    {
+        var keyParameter = Expression.Parameter(sourceKey, "key");
+        var valueParameter = Expression.Parameter(sourceValue, "value");
+        var keyBody = MapValue(keyParameter, destinationKey, null, scope, profile, null, inlineTypeMap: false);
+        var valueBody = MapValue(valueParameter, destinationValue, null, scope, profile, null, inlineTypeMap: false);
+        if (keyBody == null || valueBody == null) return null;
+
+        var built = CollectionExpressionHelper.BuildDictionary(value, sourceKey, sourceValue, destinationType, destinationKey, destinationValue,
+            Expression.Lambda(ExpressionUtil.Coerce(keyBody, destinationKey), keyParameter),
+            Expression.Lambda(ExpressionUtil.Coerce(valueBody, destinationValue), valueParameter),
+            existing);
+        if (built == null) return null;
+
+        var whenNull = (allowNull ?? profile.AllowNullCollections) || CollectionExpressionHelper.CreateEmptyCollection(destinationType) == null
+            ? (Expression)Expression.Constant(null, destinationType)
+            : ExpressionUtil.Coerce(Expression.New(destinationType.IsInterface ? typeof(Dictionary<,>).MakeGenericType(destinationKey, destinationValue) : destinationType), destinationType);
+        return Expression.Condition(ExpressionUtil.IsNull(value), whenNull, built);
+    }
+
+    // ─── Yerleşik dönüşümler ────────────────────────────────────────────────
 
     /// <summary>
-    /// Bir expression ağacındaki zincirleme üye erişimlerinde null olabilecek ara adımları toplar.
+    /// Enum, string ve sayısal türler arası yerleşik dönüşümler (AutoMapper'ın yerleşik mapper'ları ile uyumlu).
     /// </summary>
-    private static void CollectNullableSteps(Expression? expr, List<Expression> steps)
+    private static Expression? TryBuiltInConversion(Expression value, Type destinationType, BuildScope scope)
     {
-        if (expr == null) return;
+        var sourceType = value.Type;
+        if (destinationType.IsAssignableFrom(sourceType)) return ExpressionUtil.Coerce(value, destinationType);
 
-        if (expr is MemberExpression memberExpr)
+        // Enum → enum: isme göre, bulunamazsa değere göre (ProjectTo: değere göre)
+        if (sourceType.IsEnum && destinationType.IsEnum)
         {
-            // Önce ata adımları rekürsif olarak incele
-            CollectNullableSteps(memberExpr.Expression, steps);
-            
-            // Eğer doğrudan ata null olabilecek bir tip ise ve parametre değilse adımlara ekle
-            if (memberExpr.Expression != null && 
-                memberExpr.Expression is not ParameterExpression && 
-                CanBeNull(memberExpr.Expression.Type))
-            {
-                // Aynı alt ifade daha önce eklenmediyse listeye ekle
-                if (!steps.Any(s => s.ToString() == memberExpr.Expression.ToString()))
-                {
-                    steps.Add(memberExpr.Expression);
-                }
-            }
+            if (scope.IsProjection) return Expression.Convert(Expression.Convert(value, Enum.GetUnderlyingType(sourceType)), destinationType);
+            var method = typeof(EnumConverter<,>).MakeGenericType(sourceType, destinationType).GetMethod("Convert", BindingFlags.NonPublic | BindingFlags.Static)!;
+            return Expression.Call(method, value);
         }
-        else if (expr is MethodCallExpression methodCallExpr)
+
+        // Enum ↔ tamsayı
+        if (sourceType.IsEnum && IsIntegral(destinationType)) return Expression.Convert(value, destinationType);
+        if (destinationType.IsEnum && IsIntegral(sourceType)) return Expression.Convert(value, destinationType);
+
+        // string → enum
+        if (sourceType == typeof(string) && destinationType.IsEnum)
         {
-            if (methodCallExpr.Object != null)
+            if (scope.IsProjection) return null;
+            var parse = typeof(EnumParser<>).MakeGenericType(destinationType).GetMethod("Parse", BindingFlags.NonPublic | BindingFlags.Static)!;
+            return Expression.Call(parse, value);
+        }
+
+        // Herhangi bir tür → string (ToString)
+        if (destinationType == typeof(string))
+        {
+            Expression call = Expression.Call(value, sourceType.GetMethod(nameof(ToString), Type.EmptyTypes) ?? ObjectToStringMethod);
+            return sourceType.IsValueType ? call : Expression.Condition(ExpressionUtil.IsNull(value), Expression.Constant(null, typeof(string)), call);
+        }
+
+        if (scope.IsProjection)
+        {
+            // Sorgularda yalnızca SQL'e çevrilebilen sayısal dönüşümler
+            return IsNumeric(sourceType) && IsNumeric(destinationType) ? Expression.Convert(value, destinationType) : TryConversionOperator(value, destinationType);
+        }
+
+        // string → değer türleri
+        if (sourceType == typeof(string))
+        {
+            if (destinationType == typeof(Guid)) return Expression.Call(StringParsers.ParseGuidMethod, value);
+            if (destinationType == typeof(TimeSpan)) return Expression.Call(StringParsers.ParseTimeSpanMethod, value);
+            if (destinationType == typeof(DateTimeOffset)) return Expression.Call(StringParsers.ParseDateTimeOffsetMethod, value);
+            if (IsConvertible(destinationType)) return Expression.Call(StringParsers.ChangeTypeMethod.MakeGenericMethod(destinationType), value);
+        }
+
+        // IConvertible türler arası (System.Convert.ToXxx — AutoMapper ConvertMapper ile aynı)
+        if (IsConvertible(sourceType) && IsConvertible(destinationType))
+        {
+            var convert = typeof(Convert).GetMethod("To" + destinationType.Name, new[] { sourceType });
+            if (convert != null) return Expression.Call(convert, value);
+        }
+
+        return TryConversionOperator(value, destinationType);
+    }
+
+    private static Expression? TryConversionOperator(Expression value, Type destinationType)
+    {
+        var sourceType = value.Type;
+        var method = FindConversionOperator(sourceType, sourceType, destinationType) ?? FindConversionOperator(destinationType, sourceType, destinationType);
+        return method == null ? null : Expression.Convert(value, destinationType, method);
+    }
+
+    private static MethodInfo? FindConversionOperator(Type declaringType, Type sourceType, Type destinationType)
+        => declaringType.GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .FirstOrDefault(m => (m.Name == "op_Implicit" || m.Name == "op_Explicit") &&
+                                 m.ReturnType == destinationType &&
+                                 m.GetParameters().Length == 1 &&
+                                 m.GetParameters()[0].ParameterType.IsAssignableFrom(sourceType));
+
+    private static bool IsIntegral(Type type)
+        => type == typeof(int) || type == typeof(long) || type == typeof(short) || type == typeof(byte) ||
+           type == typeof(uint) || type == typeof(ulong) || type == typeof(ushort) || type == typeof(sbyte);
+
+    private static bool IsNumeric(Type type)
+        => IsIntegral(type) || type == typeof(decimal) || type == typeof(double) || type == typeof(float);
+
+    private static bool IsConvertible(Type type)
+        => type.IsPrimitive || type == typeof(decimal) || type == typeof(DateTime) || type == typeof(string);
+
+    /// <summary>Tür, üyeleri tek tek eşlenen bir "nesne" türü mü (primitive, string, enum, koleksiyon değil)?</summary>
+    internal static bool IsComplex(Type type)
+    {
+        if (Nullable.GetUnderlyingType(type) != null) return false;
+        if (type.IsPrimitive || type.IsEnum || type == typeof(string) || type == typeof(decimal) || type == typeof(object)) return false;
+        if (type == typeof(DateTime) || type == typeof(DateTimeOffset) || type == typeof(Guid) || type == typeof(TimeSpan)) return false;
+        if (type.FullName == "System.DateOnly" || type.FullName == "System.TimeOnly") return false;
+        if (typeof(Delegate).IsAssignableFrom(type)) return false;
+        return !CollectionExpressionHelper.IsCollectionType(type);
+    }
+
+    // ─── Sözlük → nesne ─────────────────────────────────────────────────────
+
+    private static Expression BuildFromDictionary(Expression value, Type destinationType, BuildScope scope)
+    {
+        var ctor = destinationType.GetConstructor(Type.EmptyTypes)
+            ?? throw new VeloxConfigurationException($"Sözlükten '{destinationType.FullName}' türüne eşleme için parametresiz kurucu gereklidir.");
+        var profile = scope.Config.DefaultProfile;
+        var dest = Expression.Variable(destinationType, "dest");
+        var dictionary = Expression.Convert(value, typeof(System.Collections.IDictionary));
+        var statements = new List<Expression> { Expression.Assign(dest, Expression.New(ctor)) };
+
+        foreach (var member in TypeMembers.GetDestinationMembers(destinationType, profile))
+        {
+            if (!TypeMembers.CanWrite(member)) continue;
+            var memberType = TypeMembers.GetMemberType(member);
+            var found = Expression.Variable(typeof(object), "found");
+            var tryGet = Expression.Call(RuntimeServices.DictionaryTryGetMethod, dictionary, Expression.Constant(member.Name), found);
+
+            Expression converted;
+            var objectValue = (Expression)found;
+            var direct = MapValue(objectValue, memberType, null, scope, profile, null, inlineTypeMap: false);
+            if (memberType.IsEnum || IsConvertible(memberType) && memberType != typeof(string))
             {
-                CollectNullableSteps(methodCallExpr.Object, steps);
-                if (methodCallExpr.Object is not ParameterExpression && CanBeNull(methodCallExpr.Object.Type))
-                {
-                    if (!steps.Any(s => s.ToString() == methodCallExpr.Object.ToString()))
-                    {
-                        steps.Add(methodCallExpr.Object);
-                    }
-                }
+                converted = Expression.Convert(Expression.Call(RuntimeServices.ConvertObjectMethod, found, Expression.Constant(memberType)), memberType);
             }
-            else if (methodCallExpr.Arguments.Count > 0)
+            else if (memberType == typeof(string))
             {
-                var firstArg = methodCallExpr.Arguments[0];
-                CollectNullableSteps(firstArg, steps);
-                if (firstArg is not ParameterExpression && CanBeNull(firstArg.Type))
-                {
-                    if (!steps.Any(s => s.ToString() == firstArg.ToString()))
-                    {
-                        steps.Add(firstArg);
-                    }
-                }
+                converted = Expression.Condition(Expression.Equal(found, Expression.Constant(null)), Expression.Constant(null, typeof(string)), Expression.Call(found, ObjectToStringMethod));
             }
+            else if (IsComplex(memberType))
+            {
+                converted = Expression.Call(RuntimeServices.MapObjectMethod.MakeGenericMethod(memberType), scope.Context!, found);
+            }
+            else
+            {
+                converted = direct != null ? ExpressionUtil.Coerce(direct, memberType) : Expression.Convert(Expression.Call(RuntimeServices.ConvertObjectMethod, found, Expression.Constant(memberType)), memberType);
+            }
+
+            statements.Add(Expression.Block(new[] { found },
+                Expression.IfThen(tryGet, Expression.Assign(Expression.MakeMemberAccess(dest, member), converted))));
+        }
+
+        statements.Add(dest);
+        return Expression.Block(new[] { dest }, statements);
+    }
+
+    // ─── Projeksiyon ────────────────────────────────────────────────────────
+
+    private static Expression BuildProjectionObject(Expression source, MappingRegistration? registration, Type destinationType, BuildScope scope)
+    {
+        var key = (source.Type, destinationType);
+        var occurrences = scope.InlineStack.Count(k => k == key);
+        if (occurrences > 0)
+        {
+            var maxDepth = registration?.MaxDepth ?? 0;
+            if (maxDepth == 0)
+            {
+                throw new VeloxProjectionException(
+                    $"{source.Type.Name} -> {destinationType.Name} projeksiyonu kendini tekrar eden (rekürsif) bir model içeriyor. " +
+                    "Sonsuz sorgu üretimini önlemek için CreateMap(...).MaxDepth(n) tanımlayın.");
+            }
+
+            if (occurrences >= maxDepth) return Expression.Constant(null, destinationType);
+        }
+
+        scope.InlineStack.Add(key);
+        try
+        {
+            var profile = scope.Config.GetProfile(registration);
+            var consumed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            NewExpression newExpression;
+            var (ctor, arguments, error) = SelectConstructor(source, registration, destinationType, scope, profile);
+            if (ctor == null)
+            {
+                if (!destinationType.IsValueType) throw new VeloxProjectionException(error!);
+                newExpression = Expression.New(destinationType);
+            }
+            else
+            {
+                newExpression = Expression.New(ctor, arguments);
+                foreach (var parameter in ctor.GetParameters()) consumed.Add(parameter.Name!);
+            }
+
+            var bindings = new List<MemberBinding>();
+            foreach (var member in TypeMembers.GetDestinationMembers(destinationType, profile))
+            {
+                if (!TypeMembers.CanWrite(member) || consumed.Contains(member.Name)) continue;
+
+                MemberMappingRule? rule = null;
+                registration?.MemberRules.TryGetValue(member.Name, out rule);
+                if (rule?.IsIgnored == true || (rule == null && profile.IsGloballyIgnored(member.Name))) continue;
+
+                var path = scope.Path.Length == 0 ? member.Name : scope.Path + "." + member.Name;
+                if (rule?.ExplicitExpansion == true && !scope.IsExpanded(path)) continue;
+
+                var raw = ResolveRawValue(source, source, Expression.Default(TypeMembers.GetMemberType(member)), member.Name, rule, registration, scope, profile);
+                if (raw == null) continue;
+
+                var memberType = TypeMembers.GetMemberType(member);
+                var previousPath = scope.Path;
+                scope.Path = path;
+                Expression? mapped;
+                try
+                {
+                    mapped = MapValue(raw, memberType, null, scope, profile, rule?.AllowNull, inlineTypeMap: false);
+                }
+                finally
+                {
+                    scope.Path = previousPath;
+                }
+
+                if (mapped == null) continue;
+                if (rule != null && rule.HasNullSubstitute && ExpressionUtil.CanBeNull(raw.Type))
+                {
+                    mapped = Expression.Condition(ExpressionUtil.IsNull(raw), SubstituteConstant(rule.NullSubstituteValue, memberType), ExpressionUtil.Coerce(mapped, memberType));
+                }
+
+                mapped = ApplyTransformers(ExpressionUtil.Coerce(mapped, memberType), memberType, rule, registration, profile, forProjection: true);
+                bindings.Add(Expression.Bind(member, mapped));
+            }
+
+            return bindings.Count > 0 ? Expression.MemberInit(newExpression, bindings) : newExpression;
+        }
+        finally
+        {
+            scope.InlineStack.RemoveAt(scope.InlineStack.Count - 1);
         }
     }
+
+    private static int InheritanceDepth(Type type)
+    {
+        var depth = 0;
+        for (var current = type.BaseType; current != null; current = current.BaseType) depth++;
+        return depth;
+    }
+}
+
+/// <summary>
+/// Tek bir ifade üretim çağrısının durumu.
+/// </summary>
+internal sealed class BuildScope
+{
+    public BuildScope(MapperConfiguration config, MappingMode mode, ParameterExpression? context)
+    {
+        Config = config;
+        Mode = mode;
+        Context = context;
+    }
+
+    public MapperConfiguration Config { get; }
+    public MappingMode Mode { get; }
+    public ParameterExpression? Context { get; }
+    public bool IsProjection => Mode == MappingMode.ProjectTo;
+    public HashSet<string>? Expansions { get; set; }
+    public List<(Type, Type)> InlineStack { get; } = new();
+    public string Path { get; set; } = string.Empty;
+
+    /// <summary>Verilen üye yolu (veya alt yolları) <c>membersToExpand</c> ile istendiyse <c>true</c>.</summary>
+    public bool IsExpanded(string path)
+    {
+        if (Expansions == null || Expansions.Count == 0) return false;
+        foreach (var expansion in Expansions)
+        {
+            if (string.Equals(expansion, path, StringComparison.OrdinalIgnoreCase) ||
+                expansion.StartsWith(path + ".", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+
+        return false;
+    }
+}
+
+/// <summary>
+/// Üretilen ifadelerin çalışma zamanında çağırdığı yardımcılar.
+/// </summary>
+internal static class RuntimeServices
+{
+    internal static readonly MethodInfo DictionaryTryGetMethod = typeof(RuntimeServices).GetMethod(nameof(TryGetCaseInsensitive), BindingFlags.NonPublic | BindingFlags.Static)!;
+    internal static readonly MethodInfo ConvertObjectMethod = typeof(RuntimeServices).GetMethod(nameof(ConvertObject), BindingFlags.NonPublic | BindingFlags.Static)!;
+    internal static readonly MethodInfo MapObjectMethod = typeof(RuntimeServices).GetMethod(nameof(MapObject), BindingFlags.NonPublic | BindingFlags.Static)!;
 
     /// <summary>
-    /// Verilen expression ağacını otomatik null propagation (güvenli üye erişimi) ile sarmalar.
+    /// Resolver/converter/action örneğini çözer: <c>ConstructServicesUsing</c> → DI konteyneri → (DI varsa) ActivatorUtilities → parametresiz kurucu.
     /// </summary>
-    public static Expression MakeNullSafe(Expression expression)
+    public static object Resolve(VeloxResolutionContext context, Type type)
     {
-        if (expression == null) return null!;
+        var service = context.GetServiceOrNull(type);
+        if (service != null) return service;
 
-        var steps = new List<Expression>();
-        CollectNullableSteps(expression, steps);
-
-        if (steps.Count == 0)
+        if (context.ServiceProvider != null)
         {
-            return expression;
+            return Microsoft.Extensions.DependencyInjection.ActivatorUtilities.CreateInstance(context.ServiceProvider, type);
         }
 
-        var resultType = expression.Type;
-        var defaultExpr = Expression.Default(resultType);
-        var result = expression;
-
-        // Adımları tersten (en yapraktan köke doğru) koşul ifadeleriyle sarmala
-        for (int i = steps.Count - 1; i >= 0; i--)
+        try
         {
-            var step = steps[i];
-            var isNull = IsNullExpression(step);
-            result = Expression.Condition(isNull, defaultExpr, result);
+            return Activator.CreateInstance(type)!;
         }
-
-        return result;
+        catch (MissingMethodException ex)
+        {
+            throw new VeloxMappingException(
+                $"'{type.FullName}' örneği oluşturulamadı: parametresiz kurucu yok. Türü DI konteynerine kaydedin " +
+                "(AddVeloxMapper ile taranan assembly'lerdeki resolver/converter'lar otomatik kaydedilir) veya ConstructServicesUsing kullanın.", ex);
+        }
     }
 
-    public static object? GetCaseInsensitiveValue(System.Collections.IDictionary dict, string key)
+    private static bool TryGetCaseInsensitive(System.Collections.IDictionary dictionary, string key, out object? value)
     {
-        foreach (System.Collections.DictionaryEntry entry in dict)
+        if (dictionary.Contains(key))
+        {
+            value = dictionary[key];
+            return true;
+        }
+
+        foreach (System.Collections.DictionaryEntry entry in dictionary)
         {
             if (string.Equals(entry.Key?.ToString(), key, StringComparison.OrdinalIgnoreCase))
             {
-                return entry.Value;
-            }
-        }
-        return null;
-    }
-
-    public static bool ContainsCaseInsensitive(System.Collections.IDictionary dict, string key)
-    {
-        foreach (System.Collections.DictionaryEntry entry in dict)
-        {
-            if (string.Equals(entry.Key?.ToString(), key, StringComparison.OrdinalIgnoreCase))
-            {
+                value = entry.Value;
                 return true;
             }
         }
+
+        value = null;
         return false;
     }
 
-    private static Expression? TryBuildDictionaryMapping(
-        Expression sourceExpr, Type source, Type destination, MapperConfiguration config, ParameterExpression? contextParam, MappingMode mode)
+    private static object? ConvertObject(object? value, Type type)
     {
-        var ctor = destination.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
-            .FirstOrDefault(c => c.GetParameters().Length == 0);
-        if (ctor == null) return null;
-
-        var destVar = Expression.Variable(destination, "dest");
-        var blockExprs = new List<Expression>
-        {
-            Expression.Assign(destVar, Expression.New(ctor))
-        };
-
-        var destProps = destination.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(p => p.CanWrite && config.ShouldMapProperty(p))
-            .ToArray();
-        var destFields = destination.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-            .Where(f => !f.IsInitOnly && config.ShouldMapField(f))
-            .ToArray();
-
-        var containsMethod = typeof(ExpressionBuilder).GetMethod(nameof(ContainsCaseInsensitive), BindingFlags.Public | BindingFlags.Static)!;
-        var getValMethod = typeof(ExpressionBuilder).GetMethod(nameof(GetCaseInsensitiveValue), BindingFlags.Public | BindingFlags.Static)!;
-
-        var castedDict = Expression.Convert(sourceExpr, typeof(System.Collections.IDictionary));
-
-        // 1. Property'leri map et
-        foreach (var destProp in destProps)
-        {
-            var key = destProp.Name;
-            var keyExpr = Expression.Constant(key);
-
-            var keyExists = Expression.Call(null, containsMethod, castedDict, keyExpr);
-            var itemAccess = Expression.Call(null, getValMethod, castedDict, keyExpr);
-            var destType = destProp.PropertyType;
-
-            Expression valExpr;
-            if (destType.IsPrimitive || destType == typeof(string) || destType == typeof(decimal) || destType.IsEnum)
-            {
-                if (destType.IsEnum)
-                {
-                    var stringToEnum = typeof(Enum).GetMethod("Parse", new[] { typeof(Type), typeof(string), typeof(bool) })!;
-                    var parseCall = Expression.Call(null, stringToEnum, Expression.Constant(destType), Expression.Call(itemAccess, typeof(object).GetMethod("ToString", Type.EmptyTypes)!), Expression.Constant(true));
-                    valExpr = Expression.Convert(parseCall, destType);
-                }
-                else
-                {
-                    valExpr = Expression.Convert(itemAccess, destType);
-                }
-            }
-            else
-            {
-                if (contextParam != null)
-                {
-                    var mapperProp = typeof(VeloxResolutionContext).GetProperty("Mapper")!;
-                    var mapperAccess = Expression.Property(contextParam, mapperProp);
-                    var mapMethod = typeof(IVeloxMapper).GetMethods()
-                        .First(m => m.Name == "Map" && 
-                                    m.IsGenericMethod && 
-                                    m.GetGenericArguments().Length == 1 && 
-                                    m.GetParameters().Length == 1 && 
-                                    m.GetParameters()[0].ParameterType == typeof(object))
-                        .MakeGenericMethod(destType);
-
-                    valExpr = Expression.Call(mapperAccess, mapMethod, itemAccess);
-                }
-                else
-                {
-                    valExpr = Expression.Convert(itemAccess, destType);
-                }
-            }
-
-            var destPropAccess = Expression.Property(destVar, destProp);
-            var assign = Expression.Assign(destPropAccess, valExpr);
-
-            var conditionalAssign = Expression.IfThen(
-                keyExists,
-                assign
-            );
-
-            blockExprs.Add(conditionalAssign);
-        }
-
-        // 2. Field'ları map et
-        foreach (var destField in destFields)
-        {
-            var key = destField.Name;
-            var keyExpr = Expression.Constant(key);
-
-            var keyExists = Expression.Call(null, containsMethod, castedDict, keyExpr);
-            var itemAccess = Expression.Call(null, getValMethod, castedDict, keyExpr);
-            var destType = destField.FieldType;
-
-            Expression valExpr;
-            if (destType.IsPrimitive || destType == typeof(string) || destType == typeof(decimal) || destType.IsEnum)
-            {
-                if (destType.IsEnum)
-                {
-                    var stringToEnum = typeof(Enum).GetMethod("Parse", new[] { typeof(Type), typeof(string), typeof(bool) })!;
-                    var parseCall = Expression.Call(null, stringToEnum, Expression.Constant(destType), Expression.Call(itemAccess, typeof(object).GetMethod("ToString", Type.EmptyTypes)!), Expression.Constant(true));
-                    valExpr = Expression.Convert(parseCall, destType);
-                }
-                else
-                {
-                    valExpr = Expression.Convert(itemAccess, destType);
-                }
-            }
-            else
-            {
-                if (contextParam != null)
-                {
-                    var mapperProp = typeof(VeloxResolutionContext).GetProperty("Mapper")!;
-                    var mapperAccess = Expression.Property(contextParam, mapperProp);
-                    var mapMethod = typeof(IVeloxMapper).GetMethods()
-                        .First(m => m.Name == "Map" && 
-                                    m.IsGenericMethod && 
-                                    m.GetGenericArguments().Length == 1 && 
-                                    m.GetParameters().Length == 1 && 
-                                    m.GetParameters()[0].ParameterType == typeof(object))
-                        .MakeGenericMethod(destType);
-
-                    valExpr = Expression.Call(mapperAccess, mapMethod, itemAccess);
-                }
-                else
-                {
-                    valExpr = Expression.Convert(itemAccess, destType);
-                }
-            }
-
-            var destFieldAccess = Expression.Field(destVar, destField);
-            var assign = Expression.Assign(destFieldAccess, valExpr);
-
-            var conditionalAssign = Expression.IfThen(
-                keyExists,
-                assign
-            );
-
-            blockExprs.Add(conditionalAssign);
-        }
-
-        blockExprs.Add(destVar);
-        return Expression.Block(new[] { destVar }, blockExprs);
+        if (value == null) return type.IsValueType ? Activator.CreateInstance(type) : null;
+        if (type.IsInstanceOfType(value)) return value;
+        if (type.IsEnum) return value is string s ? Enum.Parse(type, s, true) : Enum.ToObject(type, value);
+        return System.Convert.ChangeType(value, type, System.Globalization.CultureInfo.CurrentCulture);
     }
+
+    private static T MapObject<T>(VeloxResolutionContext context, object? value)
+        => value == null ? default! : value is T typed ? typed : ((Mapper)context.Mapper).MapRuntime<T>(value, context);
 }

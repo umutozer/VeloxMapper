@@ -60,7 +60,8 @@ public class ProxyAndNullPropagationTests
     {
         // 1. Arrange & Act
         var normalType = typeof(BaseUser);
-        var proxyType = typeof(BaseUserProxy);
+        var proxyType = typeof(Castle.Proxies.BaseUserProxy);
+        var lookalikeType = typeof(BaseUserProxy); // adı "Proxy" ile biten sıradan sınıf: çözülmemeli
 
         var resolvedNormal = Mapper.GetUnproxiedType(normalType);
         var resolvedProxy = Mapper.GetUnproxiedType(proxyType);
@@ -68,6 +69,7 @@ public class ProxyAndNullPropagationTests
         // 2. Assert
         Assert.Equal(typeof(BaseUser), resolvedNormal);
         Assert.Equal(typeof(BaseUser), resolvedProxy);
+        Assert.Equal(typeof(BaseUserProxy), Mapper.GetUnproxiedType(lookalikeType));
     }
 
     [Fact]
