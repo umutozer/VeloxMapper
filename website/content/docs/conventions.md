@@ -29,6 +29,8 @@ Ad karşılaştırması **büyük/küçük harfe duyarsızdır**. `Email`, `emai
 public class Customer
 {
     public int Id { get; set; }
+    public string FirstName { get; set; } = "";
+    public string LastName { get; set; } = "";
     public string Email { get; set; } = "";
 }
 
@@ -57,9 +59,9 @@ cfg.ShouldMapProperty = p => p.GetMethod?.IsPublic == true;
 cfg.ShouldMapField = f => false; // field'ları hiç eşleme
 ```
 
-## Get ön ekli metotlar
+## Get ön ekli üyeler
 
-`Get` ile başlayan parametresiz bir kaynak metodu, ön eki olmayan hedef üyeye eşlenir:
+AutoMapper gibi VeloxMapper da varsayılan olarak `Get` ön ekini tanır: `Get` ile başlayan parametresiz bir kaynak metodu veya `Get` ile başlayan bir kaynak property'si (`GetName` → `Name`), ön eki olmayan hedef üyeye eşlenir:
 
 ```csharp
 public class Order
@@ -74,7 +76,7 @@ public class OrderDto
 }
 ```
 
-Metot adı `Get` ile tam olarak bu harflerle başlamalıdır (ör. `GetTotal`). Aynı profilde `ClearPrefixes()` çağrısı bu davranışı kapatır.
+Üye adı `Get` ile tam olarak bu harflerle başlamalıdır (ör. `GetTotal`). Tam ad eşleşmesi her zaman önceliklidir: kaynakta hem `Name` hem `GetName` varsa hedef `Name` için `Name` kullanılır. Aynı profilde `ClearPrefixes()` çağrısı bu davranışı kapatır.
 
 ## Extension metotlar
 
@@ -109,7 +111,7 @@ cfg.RecognizeDestinationPrefixes("dto");      // hedef: dtoName → Name
 cfg.RecognizeDestinationPostfixes("Value");   // hedef: NameValue → Name
 ```
 
-Ön ek eşleşmesi büyük/küçük harfe duyarsızdır. `ClearPrefixes()` tanımlı tüm kaynak ön eklerini ve `Get` metot ön ekini temizler.
+Ön ek eşleşmesi büyük/küçük harfe duyarsızdır. `ClearPrefixes()` tanımlı tüm kaynak ön eklerini ve varsayılan `Get` ön ekini temizler.
 
 ## Üye adı değiştirme
 

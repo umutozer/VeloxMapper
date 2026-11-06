@@ -25,7 +25,7 @@ Asistanınız web'e erişebiliyorsa `llms-full.txt` adresini verin. Erişemiyors
 Aşağıdaki metni olduğu gibi kopyalayın. Kod tabanınızı okuyup düzenleyebilen bir asistanda (Claude Code, GitHub Copilot ajan modu, Cursor ve benzerleri) en iyi sonucu verir.
 
 ```text
-Bu .NET çözümünü AutoMapper'dan VeloxMapper 6.0.0'a taşı.
+Bu .NET çözümünü AutoMapper'dan VeloxMapper 6.1.0'a taşı.
 
 REFERANS
 - VeloxMapper dokümantasyonu: https://veloxmapper-website.netlify.app/llms-full.txt
@@ -38,7 +38,7 @@ REFERANS
 
 YAPILACAK DEĞİŞİKLİKLER
 1. Paketler:
-   - "AutoMapper" paket referansını "VeloxMapper" Version="6.0.0" ile değiştir.
+   - "AutoMapper" paket referansını "VeloxMapper" Version="6.1.0" ile değiştir.
    - "AutoMapper.Extensions.Microsoft.DependencyInjection" ve
      "AutoMapper.Extensions.EnumMapping" referanslarını kaldır (VeloxMapper'da yerleşik).
    - Directory.Packages.props, Directory.Build.props ve packages.config dosyalarını da kontrol et.
@@ -106,7 +106,7 @@ Asistanınız dokümantasyonu doğrudan okuyabiliyorsa şu kısa yönerge de yet
 ```text
 https://veloxmapper-website.netlify.app/llms-full.txt adresindeki VeloxMapper
 dokümantasyonunu oku. Ardından bu çözümü "Geçiş Rehberi" sayfasındaki adımlara göre
-AutoMapper'dan VeloxMapper 6.0.0'a taşı. Yalnızca belgelenmiş API'leri kullan,
+AutoMapper'dan VeloxMapper 6.1.0'a taşı. Yalnızca belgelenmiş API'leri kullan,
 "Davranış Farkları" sayfasındaki maddeleri kod tabanında ara, sonunda dotnet build,
 AssertConfigurationIsValid() testi ve dotnet test çalıştırıp sonuçları raporla.
 ```

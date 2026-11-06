@@ -56,6 +56,8 @@ Bu sayfa AutoMapper adlarının VeloxMapper karşılıklarını listeler. **Ayn�
 | AutoMapper | VeloxMapper | Durum |
 | --- | --- | --- |
 | `IMapper` | `IMapper` | Aynı |
+| `IMapperBase` | `IMapperBase` | Aynı (`IMapper` bu arayüzden türer) |
+| `IRuntimeMapper` | `IRuntimeMapper` | Aynı (`ResolutionContext.Mapper` türü) |
 | `Mapper` | `Mapper` | Aynı |
 | `ResolutionContext` | `ResolutionContext` | Aynı |
 | `IMappingOperationOptions`, `IMappingOperationOptions<TSource, TDestination>` | Aynı adlar | Aynı |
@@ -178,6 +180,6 @@ VeloxMapper 5.x ile yazılmış kod için şu adlar korunur: `IVeloxMapper` (`IM
 ## Bilinen API farkları
 
 - `TypeMap` ve `PropertyMap` yalnızca temel bilgileri sunar (`TypeMap.SourceType`, `DestinationType`, `ProfileName`; `PropertyMap.DestinationName`, `DestinationType`, `SourceMember`, `SourceType`, `TypeMap`). `ForAllMaps` / `ForAllPropertyMaps` içinde AutoMapper'ın iç `TypeMap` özelliklerini (ör. `PropertyMaps`) kullanan kod derlenmez.
-- Özel isimlendirme kuralları `VeloxMapper.Abstractions.ICustomNamingConvention` arayüzünü uygular; AutoMapper'ın `INamingConvention` arayüzü yoktur.
-- `ResolutionContext.Mapper` `IMapper` türündedir; `IRuntimeMapper` türü yoktur.
+- Özel isimlendirme kuralları `VeloxMapper.Abstractions.ICustomNamingConvention` arayüzünü uygular (tek `Normalize(string)` metodu); AutoMapper'ın `INamingConvention` arayüzü (`SplittingExpression`, `SeparatorCharacter`, `ReplaceValue`) yoktur, [geçiş betiği](./migration-script.md) bu kullanımları raporlar. Hazır `PascalCaseNamingConvention` ve `LowerUnderscoreNamingConvention` sınıfları aynı adlarla vardır.
+- `ResolutionContext.Mapper` AutoMapper ile aynı şekilde `IRuntimeMapper` türündedir (`IMapper`'dan türer); `context.Mapper.Map(...)` çağrıları dış çağrının `Items`/`State` bağlamını devralır.
 - `cfg.Internal()`, `UseAsDataSource`, `EqualityComparison` ve `IMappingExpression.AsProxy()` yoktur. `[AutoMap(..., AsProxy = true)]` derlenir ancak proxy üretmez.

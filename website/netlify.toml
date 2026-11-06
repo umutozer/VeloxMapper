@@ -31,3 +31,13 @@
   for = "/opengraph-image"
   [headers.values]
     Content-Type = "image/png"
+
+# Güvenlik başlıkları (statik site; CSP, Next.js'in satır içi RSC betikleri nedeniyle uygulanmaz)
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"

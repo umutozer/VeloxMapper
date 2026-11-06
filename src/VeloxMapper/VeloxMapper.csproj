@@ -9,11 +9,11 @@
 
     <!-- NuGet paket meta bilgileri -->
     <PackageId>VeloxMapper</PackageId>
-    <Version>6.0.0</Version>
+    <Version>6.1.0</Version>
     <Authors>Umut Ozer</Authors>
     <Description>MIT licensed, AutoMapper-compatible object mapper for .NET 8/9/10. Same API names (Profile, CreateMap, ForMember, MapFrom, IMapper, MapperConfiguration, ProjectTo, AssertConfigurationIsValid) so existing AutoMapper code migrates by changing the package and using statements. Hybrid engine: compile-time Source Generator plus cached Expression Tree compilation, EF Core ProjectTo, fail-fast validation and mapping plan diagnostics.</Description>
     <PackageProjectUrl>https://veloxmapper-website.netlify.app</PackageProjectUrl>
-    <PackageReleaseNotes>6.0.0: AutoMapper API parity (IMapper, Profile, ResolutionContext, IValueResolver, ITypeConverter, IValueConverter, IMappingAction, AddAutoMapper alias, VeloxMapper.QueryableExtensions), ReverseMap chaining, MapFrom with any source type, Map(source, destination) returns destination and maps nested objects in place, transient IMapper with scoped DI, per-profile conventions, EF Core ProjectTo fixes. See https://veloxmapper-website.netlify.app/docs/changelog</PackageReleaseNotes>
+    <PackageReleaseNotes>6.1.0: IMapperBase and IRuntimeMapper interfaces (AutoMapper parity); object to Dictionary/ExpandoObject mapping and ExpandoObject sources; default Get prefix on source properties; null reference to Nullable&lt;T&gt; stays null; IncludeMembers reversed by ReverseMap; nested context.Mapper.Map calls inherit Items/State/service factory/reference cache; scoped-provider mappers no longer pooled; migration script hardened (Razor files, aliases, fully-qualified exceptions, PrivateAssets refs, DI-only projects, string/comment masking, encoding safety, read-only files); deterministic build without local paths. See https://veloxmapper-website.netlify.app/docs/changelog</PackageReleaseNotes>
     <Copyright>© 2026 Umut Özer</Copyright>
     <PackageTags>automapper;automapper-alternative;mapper;object-mapper;mapping;dto;profile;projectto;efcore;source-generator;nativeaot;expression-tree</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

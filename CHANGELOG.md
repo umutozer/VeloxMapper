@@ -5,6 +5,28 @@ Ayrıntılı sürüm notları: https://veloxmapper-website.netlify.app/docs/chan
 
 ---
 
+## [6.1.0] - 2026-11-05
+
+### Eklenenler
+- `IMapperBase` arayüzü (`IMapper : IMapperBase`) ve `IRuntimeMapper` arayüzü (`ResolutionContext.Mapper` türü), AutoMapper ile aynı.
+- Nesne → `Dictionary<string, object>` / `IDictionary<string, object>` / `IDictionary` / `ExpandoObject` eşlemesi; `ExpandoObject` kaynak desteği.
+- Geçiş betiği: Razor dosyaları, `using X = AutoMapper;` takma adları, tam nitelikli istisna adları, ek nitelikli paket referansları,
+  DI-only projelere `VeloxMapper` ekleme, statik `Mapper` API'si / `AddCollectionMappers` / `AutoMapper.Internal` / VB-F# uyarıları,
+  yazılamayan dosyalar için çıkış kodu 1.
+
+### Düzeltilenler
+- Resolver/converter/action içinden `context.Mapper.Map(...)` çağrısı dış çağrının `Items`, `State`, servis fabrikası ve
+  referans önbelleğini devralır (AutoMapper davranışı).
+- Varsayılan `Get` ön eki kaynak property'lerde de tanınır (`GetName` → `Name`).
+- `null` referans türü kaynak → `Nullable<T>` hedef `null` kalır (ör. `null` string → `Color?`; önceden enum varsayılanı atanıyordu).
+- `IncludeMembers(s => s.Alt)` tanımı `ReverseMap` ile ters yönde `ForPath` olarak uygulanır.
+- Scoped servis sağlayıcıya bağlı mapper'ların bağlam nesneleri iş parçacığı havuzunda tutulmaz (kapanmış DI kapsamları canlı kalmaz).
+- Geçiş betiği: string/yorum içi metinler ve kullanıcı namespace'leri değiştirilmez; UTF-8/UTF-16 dışı dosyalar bozulmaz;
+  salt okunur dosya çalışmayı kesmez; kaynak içeren `packages` klasörleri taranır.
+- NuGet paketi deterministik derlenir; derleme çıktıları yerel klasör yolu içermez.
+
+---
+
 ## [6.0.0] - 2026-10-05
 
 Bu sürümün hedefi, AutoMapper kullanan projelerin **kod değiştirmeden** VeloxMapper'a geçebilmesidir: tür, metot ve

@@ -27,7 +27,7 @@ Console.WriteLine(MappingPlanReport.GenerateTextReport(plan));
 ```
 
 ```text
-[META] VeloxMapper v6.0.0 | PlanSchema v1.0
+[META] VeloxMapper v6.1.0 | PlanSchema v1.0
 [INFO] Mapping Plan: MyApp.Order -> MyApp.OrderDto [Map]
   [DETAIL] Customer => Customer (Assigned)
   [DETAIL] CustomerName => CustomerName (Flattened)
@@ -66,7 +66,7 @@ JSON çıktısı (kısaltılmış):
 
 ```json
 {
-  "veloxMapperVersion": "6.0.0",
+  "veloxMapperVersion": "6.1.0",
   "planSchemaVersion": "1.0",
   "profileName": "",
   "sourceType": "MyApp.Order",

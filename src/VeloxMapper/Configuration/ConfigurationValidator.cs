@@ -27,7 +27,7 @@ internal sealed class ConfigurationValidator
         {
             if (registration.ValidationDisabled || registration.HasTypeConverter) continue;
             if (!ExpressionBuilder.IsComplex(registration.DestinationType)) continue;
-            if (typeof(System.Collections.IDictionary).IsAssignableFrom(registration.SourceType)) continue; // sözlük anahtarları çalışma zamanında bilinir
+            if (ExpressionBuilder.IsDictionarySource(registration.SourceType)) continue; // sözlük anahtarları çalışma zamanında bilinir
             if (registration.SourceType.ContainsGenericParameters || registration.DestinationType.ContainsGenericParameters) continue;
 
             var mapErrors = ValidateRegistration(registration);

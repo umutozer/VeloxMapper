@@ -60,7 +60,7 @@ VeloxMapper'a özgü `cfg.NamingConvention` özelliği, taraf bazlı bir kural v
 | `RecognizeDestinationPostfixes(...)` | Hedef üye adlarından sonekleri atar. |
 | `ClearPrefixes()` | Tanınan önekleri temizler; varsayılan `Get` önekini de kapatır. |
 
-Varsayılan olarak parametresiz `GetX()` metotları `X` hedef üyesine eşlenir (`GetTotal()` → `Total`). Bu davranışı `ClearPrefixes()` ile kapatabilirsiniz.
+Varsayılan olarak `Get` ön eki tanınır: parametresiz `GetX()` metotları ve `GetX` property'leri `X` hedef üyesine eşlenir (`GetTotal()` → `Total`, `GetName` → `Name`). Bu davranışı `ClearPrefixes()` ile kapatabilirsiniz.
 
 ```csharp
 var config = new MapperConfiguration(cfg =>

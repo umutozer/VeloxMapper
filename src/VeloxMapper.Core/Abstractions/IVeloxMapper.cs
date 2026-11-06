@@ -5,6 +5,6 @@ namespace VeloxMapper;
 /// projelerin derlenmeye devam etmesi için korunur. DI konteynerine hem <see cref="IMapper"/> hem de
 /// <see cref="IVeloxMapper"/> olarak kaydedilir.
 /// </summary>
-public interface IVeloxMapper : IMapper
+public interface IVeloxMapper : IRuntimeMapper
 {
 }

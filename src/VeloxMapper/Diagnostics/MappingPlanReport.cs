@@ -18,7 +18,7 @@ public static class VeloxVersion
     /// Major versiyon değişikliği = breaking change.
     /// NuGet paket sürümü ile senkron tutulmalıdır.
     /// </summary>
-    public const string Current = "6.0.0";
+    public const string Current = "6.1.0";
 
     /// <summary>
     /// Plan raporu şema sürümü.

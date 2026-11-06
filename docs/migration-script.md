@@ -30,46 +30,64 @@ pwsh ./migrate-from-automapper.ps1 -Path ./src
 | Parametre | Tür | Varsayılan | Açıklama |
 | --- | --- | --- | --- |
 | `-Path` | `string` | `.` (geçerli klasör) | Taranacak kök klasör. Alt klasörler özyinelemeli taranır. |
-| `-Version` | `string` | `6.0.0` | Proje dosyalarına yazılacak VeloxMapper paket sürümü. |
+| `-Version` | `string` | `6.1.0` | Proje dosyalarına yazılacak VeloxMapper paket sürümü (`x.y.z` veya `x.y.z-önek` biçiminde olmalıdır). |
 | `-DryRun` | `switch` | kapalı | Dosyaları değiştirmeden yalnızca değişecek dosyaları ve uyarıları listeler. |
 
-Taramada `bin`, `obj`, `.git`, `.vs`, `node_modules` ve `packages` klasörleri atlanır.
+Taramada `bin`, `obj`, `.git`, `.vs` ve `node_modules` klasörleri atlanır. `packages` adlı klasörler yalnızca NuGet paket klasörüyse (`repositories.config` veya `.nupkg` içeriyorsa) atlanır; kaynak kod içeren aynı adlı klasörler taranır.
+
+### Çıkış kodu
+
+| Kod | Anlamı |
+| --- | --- |
+| `0` | Tüm değişiklikler yazıldı, elle gözden geçirilecek madde yok. |
+| `1` | En az bir dosya yazılamadı (salt okunur veya kilitli). Diğer dosyalar yazılmıştır; rapor yazılamayan dosyaları listeler. |
+| `2` | Değişiklikler yazıldı ancak elle gözden geçirilmesi gereken kullanımlar var. CI'da fark edilmesi için sıfırdan farklıdır. |
 
 ## Betiğin yaptığı değişiklikler
 
 ### Paket referansları
 
-Taranan dosyalar: `*.csproj`, `*.fsproj`, `*.vbproj`, `Directory.Packages.props`, `Directory.Build.props`, `packages.config`.
+Taranan dosyalar: `*.csproj`, `*.fsproj`, `*.vbproj`, `Directory.Packages.props`, `Directory.Build.props`, `packages.config`. Nitelik sırası ve `PrivateAssets` gibi ek nitelikler korunur.
 
 | Önce | Sonra |
 | --- | --- |
-| `<PackageReference Include="AutoMapper" Version="13.0.1" />` | `<PackageReference Include="VeloxMapper" Version="6.0.0" />` |
-| `<PackageVersion Include="AutoMapper" Version="13.0.1" />` | `<PackageVersion Include="VeloxMapper" Version="6.0.0" />` |
+| `<PackageReference Include="AutoMapper" Version="13.0.1" />` | `<PackageReference Include="VeloxMapper" Version="6.1.0" />` |
+| `<PackageReference Include="AutoMapper" PrivateAssets="all" Version="13.0.1" />` | `<PackageReference Include="VeloxMapper" PrivateAssets="all" Version="6.1.0" />` |
+| `<PackageVersion Include="AutoMapper" Version="13.0.1" />` | `<PackageVersion Include="VeloxMapper" Version="6.1.0" />` |
 | `<PackageReference Include="AutoMapper" />` (merkezi sürüm yönetimi) | `<PackageReference Include="VeloxMapper" />` |
-| `<package id="AutoMapper" version="..." />` | `<package id="VeloxMapper" version="6.0.0" />` |
+| `<package id="AutoMapper" version="..." />` | `<package id="VeloxMapper" version="6.1.0" />` |
 | `AutoMapper.Extensions.Microsoft.DependencyInjection` | Kaldırılır (VeloxMapper'da yerleşik) |
 | `AutoMapper.Extensions.EnumMapping` | Kaldırılır (VeloxMapper'da yerleşik) |
 
+Bir proje yalnızca `AutoMapper.Extensions.Microsoft.DependencyInjection` paketine referans veriyorsa (AutoMapper'ın kendisi transitif geliyorsa) kaldırılan paketin yerine `VeloxMapper` referansı eklenir; merkezi sürüm yönetimi kullanan çözümlerde `Version` niteliği yazılmaz ve `Directory.Packages.props` dosyasına `PackageVersion` eklenir.
+
 ### C# kaynak kodu
 
-Yalnızca `*.cs` dosyaları değiştirilir.
+`*.cs` dosyalarında aşağıdaki değişiklikler yapılır. Değişiklikler yalnızca koda uygulanır; **yorumlar, string sabitleri ve karakter sabitleri değiştirilmez**. `AutoMapper` adı yalnızca namespace kökü olarak eşleşir: `My.Legacy.AutoMapper.Helpers` gibi kullanıcı namespace'leri ve `AutoMapperProfileBase` gibi tür adları dokunulmaz.
 
 | Önce | Sonra |
 | --- | --- |
 | `using AutoMapper;` / `global using AutoMapper;` | `using VeloxMapper;` / `global using VeloxMapper;` |
+| `using AM = AutoMapper;` | `using AM = VeloxMapper;` |
 | `using AutoMapper.QueryableExtensions;` | `using VeloxMapper.QueryableExtensions;` |
 | `using AutoMapper.Configuration.Annotations;` | `using VeloxMapper.Configuration.Annotations;` |
 | `using AutoMapper.Configuration;` | `using VeloxMapper.Configuration;` |
 | `using AutoMapper.Extensions.EnumMapping;` | Satır silinir |
 | `using AutoMapper.Extensions.ExpressionMapping;` | `using VeloxMapper; // TODO: ...` yorumuyla değiştirilir |
 | `.AddAutoMapper(` | `.AddVeloxMapper(` |
-| `AutoMapperMappingException` | `VeloxMapper.Exceptions.VeloxMappingException` |
+| `AutoMapperMappingException`, `AutoMapper.AutoMapperMappingException` | `VeloxMapper.Exceptions.VeloxMappingException` |
 | `AutoMapperConfigurationException` | `VeloxMapper.Exceptions.VeloxValidationException` |
 | `DuplicateTypeMapConfigurationException` | `VeloxMapper.Exceptions.VeloxConfigurationException` |
 | `AutoMapper.QueryableExtensions.` | `VeloxMapper.QueryableExtensions.` |
-| `AutoMapper.IMapper`, `AutoMapper.Profile`, `AutoMapper.MapperConfiguration` ve diğer tam nitelikli adlar | `VeloxMapper.IMapper`, `VeloxMapper.Profile`, ... |
+| `AutoMapper.IMapper`, `global::AutoMapper.Profile`, `AutoMapper.MapperConfiguration`, `AutoMapper.IRuntimeMapper` ve diğer tam nitelikli adlar | `VeloxMapper.IMapper`, `global::VeloxMapper.Profile`, ... |
 
-Dosya kodlaması (UTF-8 BOM varlığı dahil) ve satır sonları korunur.
+### Razor dosyaları
+
+`*.razor` ve `*.cshtml` dosyalarında `@using AutoMapper`, `@using AutoMapper.QueryableExtensions` ve `@inject AutoMapper.IMapper` gibi kullanımlar aynı kurallarla güncellenir.
+
+### Kodlama ve satır sonları
+
+UTF-8 (BOM'lu veya BOM'suz) ve UTF-16 dosyaların kodlaması ile satır sonları (CRLF/LF) korunur. Başka bir kodlamayla (ör. Windows-1252) kaydedilmiş dosyalar **değiştirilmez** ve raporda listelenir; bu dosyaları UTF-8'e çevirip betiği yeniden çalıştırın veya elle güncelleyin. Tüm değişiklikler önce bellekte hazırlanır, ardından yazılır; salt okunur veya kilitli bir dosya diğer dosyaların yazılmasını engellemez, yalnızca raporda listelenir ve çıkış kodu `1` olur.
 
 ### Elle gözden geçirilmesi gereken kullanımlar
 
@@ -79,8 +97,11 @@ Betik aşağıdaki kullanımları **değiştirmez**, yalnızca raporlar:
 | --- | --- | --- |
 | `.Internal()` | AutoMapper'ın iç API'si | `cfg.ForAllMaps` veya `cfg.ForAllPropertyMaps` kullanın. |
 | `UseAsDataSource` | `AutoMapper.Extensions.ExpressionMapping` desteklenmez | `ProjectTo` kullanın. |
-| `EqualityComparison` | `AutoMapper.Collection` desteklenmez | Koleksiyonlar Clear + Add ile eşlenir; eşleştirmeli güncelleme için [Mevcut Nesneye Eşleme](./map-to-existing.md#koleksiyonları-anahtara-göre-güncelleme) sayfasına bakın. |
+| `EqualityComparison`, `AddCollectionMappers()` | `AutoMapper.Collection` desteklenmez | Koleksiyonlar Clear + Add ile eşlenir; eşleştirmeli güncelleme için [Mevcut Nesneye Eşleme](./map-to-existing.md#koleksiyonları-anahtara-göre-güncelleme) sayfasına bakın. |
 | `.AsProxy()` | Arayüz proxy'leri üretilmez | Somut bir hedef tür kullanın. |
+| `Mapper.Initialize(...)`, statik `Mapper.Map(...)` | AutoMapper 8 ve öncesinin statik API'si | `MapperConfiguration` oluşturup `IMapper` enjekte edin. |
+| `using AutoMapper.Internal;`, `AutoMapper.Execution`, `AutoMapper.Features`, `AutoMapper.Mappers` | İç namespace'lerin karşılığı yok | Satırı ve bu namespace'lerden gelen kullanımları kaldırın. |
+| `*.vb`, `*.fs` dosyalarında `AutoMapper` | VB ve F# kaynakları otomatik değiştirilmez | `Imports AutoMapper` / `open AutoMapper` satırlarını ve tür adlarını elle güncelleyin. |
 | `AutoMapper.Collection`, `AutoMapper.EF6`, `AutoMapper.Data`, `AutoMapper.Extensions.ExpressionMapping`, `AutoMapper.AspNetCore.OData` paketleri | VeloxMapper karşılığı yok | Kullanımı kaldırın veya yeniden yazın; paket referansını elle silin. |
 
 ## Örnek çıktı
@@ -115,7 +136,7 @@ Sonraki adımlar:
    <ItemGroup>
 -    <PackageReference Include="AutoMapper" Version="13.0.1" />
 -    <PackageReference Include="AutoMapper.Extensions.Microsoft.DependencyInjection" Version="12.0.1" />
-+    <PackageReference Include="VeloxMapper" Version="6.0.0" />
++    <PackageReference Include="VeloxMapper" Version="6.1.0" />
    </ItemGroup>
 --- a/src/Shop.Api/Program.cs
 +++ b/src/Shop.Api/Program.cs

@@ -118,7 +118,7 @@ var dto = mapper.Map<ProductDto>(product, opt => opt.Items["Culture"] = "en");
 ## Sınırlamalar
 
 - Resolver'lar [ProjectTo](./projection.md) sorgularına çevrilemez. Resolver kullanan üyeler projeksiyondan çıkarılır ve `DiagnosticsSink`/`ILogger`'a bir uyarı yazılır.
-- Resolver içinden `context.Mapper.Map(...)` çağırırsanız yeni bir eşleme bağlamı başlar; `Items` iç çağrıya aktarılmaz.
+- Resolver içinden `context.Mapper.Map(...)` çağırırsanız dış çağrının `Items`, `State` ve `ConstructServicesUsing` ayarları iç çağrıda da görünür (AutoMapper ile aynı). İç çağrıya kendi `opt => opt.Items[...]` seçeneklerini verirseniz onlar öncelikli olur.
 
 ## AutoMapper uyumluluğu
 

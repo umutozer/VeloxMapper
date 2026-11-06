@@ -236,6 +236,8 @@ Bellek içi LINQ'ten farklı olarak SQL'de `NULL` bir ilişkinin üyesine erişm
 AddressCity = IIF((source.Address == null), default(String), source.Address.City)
 ```
 
+Null kontrolü yalnızca ara navigasyon üyeleri için üretilir. Koleksiyon üyeleri (`Lines`, `Tags`) projeksiyonda doğrudan `Select(...).ToList()` ile okunur; ilişkisel sağlayıcılarda koleksiyon navigasyonları hiçbir zaman `null` olmadığından bu yeterlidir. Bellek içi (InMemory) sağlayıcı veya JSON kolonlarından gelen `null` bir ilkel koleksiyon (`List<string>? Tags = null`) projeksiyonda `ArgumentNullException` üretebilir; bu durumda kaynak üyeyi boş koleksiyonla başlatın veya `MapFrom(s => s.Tags ?? new List<string>())` kullanın.
+
 Bu davranış `EnableNullPropagationForQueryMapping` ayarıyla yönetilir ve VeloxMapper'da varsayılan olarak açıktır (AutoMapper'da kapalıdır). Global olarak veya profil bazında kapatabilirsiniz:
 
 ```csharp
@@ -313,6 +315,6 @@ Projeksiyon ifadesinin kendisini görmek için `query.Expression.ToString()` kul
 | `EnableNullPropagationForQueryMapping` varsayılanı | `false` | `true` |
 | Rekürsif model, `MaxDepth` yok | Derin/sonsuz ifade | `VeloxProjectionException` |
 | `query.ProjectTo<T>(mapper)` kısayolu | Yok | Var |
-| Polimorfik projeksiyon (`Include`) | Desteklenir | 6.0.0'da desteklenmez |
+| Polimorfik projeksiyon (`Include`) | Desteklenir | 6.1.0'da desteklenmez |
 
 Tüm farklar için [Davranış Farkları](./behavior-differences.md) sayfasına bakın.

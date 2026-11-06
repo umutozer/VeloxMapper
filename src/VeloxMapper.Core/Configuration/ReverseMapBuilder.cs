@@ -68,6 +68,22 @@ internal static class ReverseMapBuilder
             forPaths.Add(new ForPathRule(path, new MemberMappingRule(path[path.Length - 1], lambda)));
         }
 
+        // 2b. IncludeMembers → ters yönde ForPath(s => s.Alt, o => o.MapFrom(d => d)) (AutoMapper davranışı)
+        if (forward.IncludeMembers != null)
+        {
+            foreach (var include in forward.IncludeMembers)
+            {
+                var chain = MemberChain.TryGetPath(include.Body, include.Parameters[0]);
+                if (chain == null || !IsWritable(chain[chain.Count - 1])) continue;
+                var segments = chain.Select(m => m.Name).ToArray();
+                if (PathConfigured(segments)) continue;
+
+                var parameter = Expression.Parameter(forward.DestinationType, "src");
+                var identity = Expression.Lambda(parameter, parameter);
+                forPaths.Add(new ForPathRule(segments, new MemberMappingRule(segments[segments.Length - 1], identity)));
+            }
+        }
+
         reverse.ForPathRules = forPaths;
 
         // 3. Enum eşleştirmesi

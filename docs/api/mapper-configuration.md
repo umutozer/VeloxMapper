@@ -156,7 +156,7 @@ Bu üyeler `IProfileExpression` arayüzünden gelir ve profillerde de aynı adla
 | `AllowNullCollections` | `false` | Bkz. [Null Yönetimi](../null-handling.md). |
 | `EnableNullPropagationForQueryMapping` | `true` | `ProjectTo` ifadelerinde ara üye null kontrolleri. |
 | `SourceMemberNamingConvention`, `DestinationMemberNamingConvention` | `null` | Bkz. [İsimlendirme Kuralları](../naming-conventions.md). |
-| `RecognizePrefixes`, `RecognizePostfixes`, `RecognizeDestinationPrefixes`, `RecognizeDestinationPostfixes`, `ClearPrefixes` | `Get` metot öneki tanınır | Önek/sonek kuralları. |
+| `RecognizePrefixes`, `RecognizePostfixes`, `RecognizeDestinationPrefixes`, `RecognizeDestinationPostfixes`, `ClearPrefixes` | `Get` öneki varsayılan olarak tanınır | Önek/sonek kuralları. |
 | `ReplaceMemberName(string, string)` | | Kaynak üye adlarında karşılaştırma öncesi metin değiştirme. |
 | `AddGlobalIgnore(string)` | | Verilen metinle başlayan hedef üyeleri tüm eşlemelerde yok sayar. `VeloxMapperOptions` ayrıca `params string[]` overload'u sunar. |
 | `ShouldMapProperty`, `ShouldMapField`, `ShouldMapMethod` | Public getter/setter; public field; parametresiz metotlar | Üye keşfi. |

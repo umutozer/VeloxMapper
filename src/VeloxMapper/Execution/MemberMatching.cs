@@ -169,7 +169,8 @@ internal static class NameMatcher
 
             var seeds = new List<string> { name };
             if (replaced != name) seeds.Add(replaced);
-            if (isMethod && profile.RecognizeGetPrefix)
+            // AutoMapper varsayılan olarak "Get" ön ekini tanır: GetName() metodu ve GetName property'si → Name
+            if (profile.RecognizeGetPrefix)
             {
                 foreach (var seed in seeds.ToList())
                 {

@@ -146,7 +146,12 @@ internal static class ExpressionBuilder
         if (destinationUnderlying != null)
         {
             var inner = MapValue(value, destinationUnderlying, null, scope, profile, allowNull, inlineTypeMap: false);
-            return inner == null ? null : Expression.Convert(inner, destinationType);
+            if (inner == null) return null;
+            var wrapped = (Expression)Expression.Convert(inner, destinationType);
+            // Referans türü kaynak null ise hedef Nullable<T> null kalır (ör. null string → Color? → null, Red değil)
+            return ExpressionUtil.CanBeNull(sourceType) && value is not ConstantExpression
+                ? Expression.Condition(ExpressionUtil.IsNull(value), Expression.Default(destinationType), wrapped)
+                : wrapped;
         }
 
         // 6. Enum ve yerleşik dönüşümler
@@ -154,9 +159,15 @@ internal static class ExpressionBuilder
         if (builtIn != null) return builtIn;
 
         // 7. Sözlük → nesne
-        if (typeof(System.Collections.IDictionary).IsAssignableFrom(sourceType) && IsComplex(destinationType) && !scope.IsProjection && registration == null)
+        if (IsDictionarySource(sourceType) && IsComplex(destinationType) && !scope.IsProjection && registration == null)
         {
             return BuildFromDictionary(value, destinationType, scope);
+        }
+
+        // 7b. Nesne → sözlük / ExpandoObject (AutoMapper'ın ToStringDictionaryMapper / ToDynamicMapper karşılığı)
+        if (!scope.IsProjection && registration == null && IsComplex(sourceType) && !IsDictionarySource(sourceType) && IsObjectDictionaryDestination(destinationType))
+        {
+            return BuildToDictionary(value, destinationType, scope, profile);
         }
 
         // 8. Karmaşık tür → karmaşık tür
@@ -196,7 +207,7 @@ internal static class ExpressionBuilder
         if (scope.InlineStack.Contains((sourceType, destinationType))) return false;
         if (scope.Config.IsPrecompiled(sourceType, destinationType)) return false;
         if (destinationType.IsAbstract || destinationType.IsInterface) return false;
-        if (typeof(System.Collections.IDictionary).IsAssignableFrom(sourceType)) return false;
+        if (IsDictionarySource(sourceType)) return false;
         return registration == null ||
                (registration.IncludedDerivedTypes.Count == 0 && !registration.PreserveReferences && registration.MaxDepth == 0 &&
                 registration.RedirectDestinationType == null && !registration.HasTypeConverter);
@@ -266,7 +277,7 @@ internal static class ExpressionBuilder
 
         if (scope.IsProjection) return BuildProjectionObject(source, registration, destinationType, scope);
 
-        if (typeof(System.Collections.IDictionary).IsAssignableFrom(source.Type) && existing == null && (registration == null || registration.MemberRules.Count == 0))
+        if (IsDictionarySource(source.Type) && existing == null && (registration == null || registration.MemberRules.Count == 0))
         {
             return BuildFromDictionary(source, destinationType, scope);
         }
@@ -1117,6 +1128,44 @@ internal static class ExpressionBuilder
         return !CollectionExpressionHelper.IsCollectionType(type);
     }
 
+    /// <summary>Kaynak, anahtarları çalışma zamanında bilinen bir sözlük mü (<c>IDictionary</c>, <c>IDictionary&lt;string, object&gt;</c>, <c>ExpandoObject</c>)?</summary>
+    internal static bool IsDictionarySource(Type type)
+        => typeof(System.Collections.IDictionary).IsAssignableFrom(type) || typeof(IDictionary<string, object>).IsAssignableFrom(type);
+
+    /// <summary>Hedef, üye adlarını anahtar olarak alabilen bir sözlük mü (<c>Dictionary&lt;string, object&gt;</c>, <c>IDictionary&lt;string, object&gt;</c>, <c>IDictionary</c>, <c>ExpandoObject</c>)?</summary>
+    private static bool IsObjectDictionaryDestination(Type type)
+    {
+        if (type == typeof(System.Collections.IDictionary)) return true;
+        if (!CollectionExpressionHelper.TryGetDictionaryTypes(type, out var key, out var value)) return false;
+        if (key != typeof(string) || value != typeof(object)) return false;
+        return type.IsInterface || type.GetConstructor(Type.EmptyTypes) != null;
+    }
+
+    // ─── Nesne → sözlük ─────────────────────────────────────────────────────
+
+    private static Expression BuildToDictionary(Expression value, Type destinationType, BuildScope scope, ProfileMap profile)
+    {
+        var concreteType = destinationType.IsInterface ? typeof(Dictionary<string, object>) : destinationType;
+        var dictionary = Expression.Variable(concreteType, "dictionary");
+        var asGeneric = Expression.Convert(dictionary, typeof(IDictionary<string, object>));
+        var setItem = typeof(IDictionary<string, object>).GetProperty("Item")!.SetMethod!;
+        var statements = new List<Expression> { Expression.Assign(dictionary, Expression.New(concreteType.GetConstructor(Type.EmptyTypes)!)) };
+
+        foreach (var member in TypeMembers.GetSourceMembers(value.Type, profile))
+        {
+            if (member is not PropertyInfo && member is not FieldInfo) continue;
+            if (member is PropertyInfo property && (property.GetMethod == null || property.GetIndexParameters().Length > 0)) continue;
+            statements.Add(Expression.Call(asGeneric, setItem, Expression.Constant(member.Name),
+                Expression.Convert(Expression.MakeMemberAccess(value, member), typeof(object))));
+        }
+
+        statements.Add(ExpressionUtil.Coerce(dictionary, destinationType));
+        var block = Expression.Block(destinationType, new[] { dictionary }, statements);
+        return ExpressionUtil.CanBeNull(value.Type) && value is not ParameterExpression
+            ? Expression.Condition(ExpressionUtil.IsNull(value), Expression.Default(destinationType), block)
+            : block;
+    }
+
     // ─── Sözlük → nesne ─────────────────────────────────────────────────────
 
     private static Expression BuildFromDictionary(Expression value, Type destinationType, BuildScope scope)
@@ -1125,7 +1174,9 @@ internal static class ExpressionBuilder
             ?? throw new VeloxConfigurationException($"Sözlükten '{destinationType.FullName}' türüne eşleme için parametresiz kurucu gereklidir.");
         var profile = scope.Config.DefaultProfile;
         var dest = Expression.Variable(destinationType, "dest");
-        var dictionary = Expression.Convert(value, typeof(System.Collections.IDictionary));
+        var nonGeneric = typeof(System.Collections.IDictionary).IsAssignableFrom(value.Type);
+        var dictionary = Expression.Convert(value, nonGeneric ? typeof(System.Collections.IDictionary) : typeof(IDictionary<string, object>));
+        var tryGetMethod = nonGeneric ? RuntimeServices.DictionaryTryGetMethod : RuntimeServices.GenericDictionaryTryGetMethod;
         var statements = new List<Expression> { Expression.Assign(dest, Expression.New(ctor)) };
 
         foreach (var member in TypeMembers.GetDestinationMembers(destinationType, profile))
@@ -1133,7 +1184,7 @@ internal static class ExpressionBuilder
             if (!TypeMembers.CanWrite(member)) continue;
             var memberType = TypeMembers.GetMemberType(member);
             var found = Expression.Variable(typeof(object), "found");
-            var tryGet = Expression.Call(RuntimeServices.DictionaryTryGetMethod, dictionary, Expression.Constant(member.Name), found);
+            var tryGet = Expression.Call(tryGetMethod, dictionary, Expression.Constant(member.Name), found);
 
             Expression converted;
             var objectValue = (Expression)found;
@@ -1294,6 +1345,7 @@ internal sealed class BuildScope
 internal static class RuntimeServices
 {
     internal static readonly MethodInfo DictionaryTryGetMethod = typeof(RuntimeServices).GetMethod(nameof(TryGetCaseInsensitive), BindingFlags.NonPublic | BindingFlags.Static)!;
+    internal static readonly MethodInfo GenericDictionaryTryGetMethod = typeof(RuntimeServices).GetMethod(nameof(TryGetCaseInsensitiveGeneric), BindingFlags.NonPublic | BindingFlags.Static)!;
     internal static readonly MethodInfo ConvertObjectMethod = typeof(RuntimeServices).GetMethod(nameof(ConvertObject), BindingFlags.NonPublic | BindingFlags.Static)!;
     internal static readonly MethodInfo MapObjectMethod = typeof(RuntimeServices).GetMethod(nameof(MapObject), BindingFlags.NonPublic | BindingFlags.Static)!;
 
@@ -1333,6 +1385,27 @@ internal static class RuntimeServices
         foreach (System.Collections.DictionaryEntry entry in dictionary)
         {
             if (string.Equals(entry.Key?.ToString(), key, StringComparison.OrdinalIgnoreCase))
+            {
+                value = entry.Value;
+                return true;
+            }
+        }
+
+        value = null;
+        return false;
+    }
+
+    private static bool TryGetCaseInsensitiveGeneric(IDictionary<string, object> dictionary, string key, out object? value)
+    {
+        if (dictionary.TryGetValue(key, out var exact))
+        {
+            value = exact;
+            return true;
+        }
+
+        foreach (var entry in dictionary)
+        {
+            if (string.Equals(entry.Key, key, StringComparison.OrdinalIgnoreCase))
             {
                 value = entry.Value;
                 return true;

@@ -10,7 +10,7 @@
 
     <!-- NuGet paket meta bilgileri -->
     <PackageId>VeloxMapper.Core</PackageId>
-    <Version>6.0.0</Version>
+    <Version>6.1.0</Version>
     <Authors>Umut Ozer</Authors>
     <Description>VeloxMapper core abstractions, attributes, exceptions and caching primitives. High-performance, deterministic, NativeAOT-compatible object mapping library.</Description>
     <PackageTags>mapping;object-mapper;source-generator;nativeaot</PackageTags>

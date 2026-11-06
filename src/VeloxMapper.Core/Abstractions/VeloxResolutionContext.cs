@@ -15,7 +15,7 @@ public sealed class VeloxResolutionContext : ResolutionContext, IDisposable
     /// <param name="mapper">Mapper örneği.</param>
     /// <param name="serviceProvider">Servis sağlayıcı (isteğe bağlı).</param>
     /// <param name="items">Başlangıç öğeleri (isteğe bağlı).</param>
-    public VeloxResolutionContext(IMapper mapper, IServiceProvider? serviceProvider = null, IDictionary<string, object>? items = null)
+    public VeloxResolutionContext(IRuntimeMapper mapper, IServiceProvider? serviceProvider = null, IDictionary<string, object>? items = null)
         : base(mapper, serviceProvider, items)
     {
     }
@@ -25,7 +25,7 @@ public sealed class VeloxResolutionContext : ResolutionContext, IDisposable
     /// </summary>
     public void Dispose()
     {
-        ReferenceCache?.Clear();
+        if (!SharesOuterReferenceCache) ReferenceCache?.Clear();
         ReferenceCache = null;
     }
 }

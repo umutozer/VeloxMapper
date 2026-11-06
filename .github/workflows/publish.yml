@@ -1,0 +1,78 @@
+# nuget.org'a Trusted Publishing (OIDC) ile yayın. API anahtarı saklanmaz:
+# nuget.org'daki "VeloxMapper GitHub" politikası bu depo + bu dosya adına (publish.yml) güvenir
+# ve NuGet/login adımı her çalıştırmada kısa ömürlü bir anahtar üretir.
+#
+# Tetikleme: `v6.1.0` gibi bir etiket push edildiğinde (etiket, csproj'daki <Version> ile aynı olmalı)
+# veya Actions sekmesinden elle (workflow_dispatch).
+name: Publish to NuGet
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # NuGet/login için OIDC belirteci
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, test and push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Verify tag matches package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' src/VeloxMapper/VeloxMapper.csproj | head -n1)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "csproj Version=$version, tag=$tag"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Tag v$tag does not match <Version>$version</Version> in src/VeloxMapper/VeloxMapper.csproj"
+            exit 1
+          fi
+
+      - name: Restore
+        run: dotnet restore VeloxMapper.slnx
+
+      - name: Build
+        run: dotnet build VeloxMapper.slnx -c Release --no-restore
+
+      - name: Test
+        run: dotnet test tests/VeloxMapper.Tests -c Release --no-build --logger "trx;LogFileName=test-results.trx"
+
+      - name: Pack
+        run: dotnet pack src/VeloxMapper/VeloxMapper.csproj -c Release --no-build -o artifacts
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+
+      - name: NuGet login (Trusted Publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: umuto # nuget.org kullanıcı adı (politikadaki "Package owner")
+
+      - name: Push to nuget.org
+        run: >
+          dotnet nuget push artifacts/*.nupkg
+          --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate

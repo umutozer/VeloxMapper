@@ -17,11 +17,13 @@ VeloxMapper, AutoMapper'ın belgelenmiş davranışlarının büyük çoğunluğ
 | 2 | [`ProjectTo` ve resolver'lar](#2-projectto-içinde-resolver-ve-converter-kuralları) | Hata fırlatır | Üyeyi projeksiyondan çıkarır, uyarı loglar | Üye varsayılan değerde kalır |
 | 3 | [Sorgu null yayılımı](#3-sorgularda-null-yayılımı) | Varsayılan kapalı | Varsayılan açık | Farklı SQL |
 | 4 | [`Items` erişimi](#4-opts-olmadan-items-erişimi) | Seçenek yoksa hata | Boş sözlük | Hata yerine boş sözlük |
-| 5 | [İç içe `context.Mapper.Map`](#5-resolver-içinden-contextmappermap) | Bağlamı paylaşır | Yeni bağlam başlatır | `Items` aktarılmaz |
-| 6 | [Value transformer ve null](#6-value-transformerlar-ve-null) | Transformer çalışabilir | `null` korunur | Transformer çalışmaz |
-| 7 | [Rekürsif `ProjectTo`](#7-rekürsif-modellerde-projectto) | Derinlik sınırı olmadan ifade üretir | `MaxDepth` ister | Açıklayıcı hata |
-| 8 | [İstisnalar](#değişen-istisna-türleri-ve-mesajlar) | `AutoMapper*Exception` | `Velox*Exception`, Türkçe mesaj | `catch` blokları |
-| 9 | [Desteklenmeyen API'ler](#desteklenmeyen-apiler) | Var | Yok | Elle yeniden yazım |
+| 5 | [Value transformer ve null](#5-value-transformerlar-ve-null) | Transformer çalışabilir | `null` korunur | Transformer çalışmaz |
+| 6 | [Rekürsif `ProjectTo`](#6-rekürsif-modellerde-projectto) | Derinlik sınırı olmadan ifade üretir | `MaxDepth` ister | Açıklayıcı hata |
+| 7 | [İstisnalar](#değişen-istisna-türleri-ve-mesajlar) | `AutoMapper*Exception` | `Velox*Exception`, Türkçe mesaj | `catch` blokları |
+| 8 | [Desteklenmeyen API'ler](#desteklenmeyen-apiler) | Var | Yok | Elle yeniden yazım |
+
+> **6.1.0 ile kaldırılan fark:** Resolver, converter veya action içinden `context.Mapper.Map(...)` çağrıldığında dış çağrının bağlamı
+> (`Items`, `State`, `ConstructServicesUsing`, referans önbelleği) artık AutoMapper'daki gibi iç çağrıya aktarılır.
 
 ## 1. Tanımlanmamış tür çiftleri
 
@@ -77,26 +79,7 @@ cfg.EnableNullPropagationForQueryMapping = false;
 
 **Ne yapmalısınız:** Genellikle bir şey yapmanız gerekmez. `Items` erişiminin hata vermesine dayanan bir mantık varsa `TryGetItems` kullanın.
 
-## 5. Resolver içinden context.Mapper.Map
-
-**AutoMapper:** Bir resolver içinden `context.Mapper.Map(...)` çağrıldığında dış eşlemenin bağlamı (`Items` dahil) iç çağrıya aktarılır.
-
-**VeloxMapper:** İç çağrı yeni bir bağlam başlatır; `Items` paylaşılmaz.
-
-**Ne yapmalısınız:** İç eşlemenin `Items` değerlerine ihtiyacı varsa bunları açıkça aktarın:
-
-```csharp
-public string Resolve(Order source, OrderDto destination, string destMember, ResolutionContext context)
-{
-    var culture = (string)context.Items["culture"];
-    var customer = context.Mapper.Map<CustomerDto>(source.Customer, opt => opt.Items["culture"] = culture);
-    return customer.FullName;
-}
-```
-
-Daha iyisi, iç nesneyi resolver yerine `ForMember(d => d.Customer, o => o.MapFrom(s => s.Customer))` ile eşlemektir; bu durumda bağlam paylaşılır.
-
-## 6. Value transformer'lar ve null
+## 5. Value transformer'lar ve null
 
 **AutoMapper:** `ValueTransformers` ile tanımlanan dönüşüm, değer `null` olsa da çalışabilir.
 
@@ -109,7 +92,7 @@ cfg.ValueTransformers.Add<string>(s => s.Trim());
 
 **Ne yapmalısınız:** `null` değeri başka bir değere çeviren bir transformer kullanıyorsanız (ör. `s => s ?? ""`), bunun yerine üye düzeyinde `NullSubstitute("")` veya `ForAllPropertyMaps` ile toplu `NullSubstitute` kullanın.
 
-## 7. Rekürsif modellerde ProjectTo
+## 6. Rekürsif modellerde ProjectTo
 
 **AutoMapper:** Kendine referans veren modellerde (`Category.Parent`, `Employee.Manager`) `MaxDepth` tanımlanmamışsa derinlik sınırı olmadan ifade üretmeye çalışır.
 
@@ -155,6 +138,9 @@ Asıl istisna `InnerException` özelliğindedir. `VeloxException` türevleri sar
 | `UseAsDataSource(...)` | `AutoMapper.Extensions.ExpressionMapping` | DTO üzerinden sorgu yazmak yerine varlık üzerinde filtreleyip `ProjectTo` kullanın. |
 | `EqualityComparison(...)` | `AutoMapper.Collection` | Koleksiyonlar Clear + Add ile eşlenir. Anahtara göre güncelleme için [Mevcut Nesneye Eşleme](./map-to-existing.md#koleksiyonları-anahtara-göre-güncelleme) sayfasındaki deseni kullanın. |
 | `cfg.Internal()` | AutoMapper iç API'si | `cfg.ForAllMaps(...)` ve `cfg.ForAllPropertyMaps(...)` |
+| `INamingConvention` ile özel isimlendirme kuralı | AutoMapper | `VeloxMapper.Abstractions.ICustomNamingConvention` uygulayın (`Normalize`); bkz. [İsimlendirme Kuralları](./naming-conventions.md#özel-kural-yazmak). |
+| `CreateMap<Source, IDestination>()` ile arayüz hedefine eşleme | AutoMapper çalışma zamanında arayüzü uygulayan bir proxy sınıfı üretir | Somut bir hedef tür tanımlayın ve `Include` / `As<T>()` ile yönlendirin. |
+| `cfg.EnableEnumMappingValidation()` | `AutoMapper.Extensions.EnumMapping` | Çağrıyı kaldırın; `ConvertUsingEnumMapping` tanımları yapılandırma sırasında doğrulanır. |
 | Arayüz proxy'leri (`AsProxy`) | AutoMapper | Hedef soyut tür veya arayüz ise somut bir tür belirtin (`As<T>()`, `Include`, `ConstructUsing`). `[AutoMap(..., AsProxy = true)]` derlenir ancak proxy üretmez. |
 
 [Geçiş betiği](./migration-script.md) bu kullanımları bulduğunda uyarı verir.
@@ -171,6 +157,7 @@ Aşağıdaki davranışlar AutoMapper ile aynıdır ve VeloxMapper test paketind
 - Kurucu seçimi, record desteği, `ForCtorParam`
 - `Include` / `IncludeBase` / `IncludeAllDerived` ile kalıtım ve çalışma zamanı türüne göre seçim
 - `Condition` üçüncü parametresi ile PATCH deseni
+- Resolver/converter/action içinden `context.Mapper.Map(...)` çağrısında `Items`, `State` ve servis fabrikasının iç çağrıya aktarılması
 - Profil düzeyinde konvansiyon ayarları
 
 Ayrıntılar için [Temel Kavramlar](./configuration.md) bölümüne bakın.

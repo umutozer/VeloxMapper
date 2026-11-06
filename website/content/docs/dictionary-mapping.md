@@ -59,26 +59,23 @@ Sözlük türündeki üyeler de aynı şekilde eşlenir; `Dictionary<string, int
 
 ## Nesneden sözlüğe
 
-Bir nesneyi `Dictionary<string, object>`'e dönüştürme VeloxMapper 6.0.0'da yerleşik olarak desteklenmez; `mapper.Map<Dictionary<string, object>>(product)` çağrısı `VeloxConfigurationException` fırlatır. Bu dönüşümü bir type converter ile tanımlayın:
-
-```csharp title="ObjectToDictionaryConverter.cs"
-using System.Reflection;
-using VeloxMapper;
-
-public sealed class ObjectToDictionaryConverter<T> : ITypeConverter<T, Dictionary<string, object?>>
-{
-    private static readonly PropertyInfo[] Properties =
-        typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance).Where(p => p.CanRead).ToArray();
-
-    public Dictionary<string, object?> Convert(T source, Dictionary<string, object?> destination, ResolutionContext context)
-        => Properties.ToDictionary(p => p.Name, p => p.GetValue(source));
-}
-```
+Bir nesne, üye adları anahtar olacak şekilde `Dictionary<string, object>`, `IDictionary<string, object>`, `IDictionary` veya `ExpandoObject` (`dynamic`) hedefine yapılandırma gerekmeden eşlenir. Değerler olduğu gibi kopyalanır; iç nesneler düzleştirilmez ve dönüştürülmez (AutoMapper ile aynı).
 
 ```csharp
-CreateMap<Product, Dictionary<string, object?>>().ConvertUsing(new ObjectToDictionaryConverter<Product>());
+using System.Dynamic;
 
-var values = mapper.Map<Dictionary<string, object?>>(product);
+var values = mapper.Map<Dictionary<string, object>>(product);
+// values["Code"] == product.Code, values["Price"] == product.Price, values["Category"] == product.Category (aynı referans)
+
+dynamic expando = mapper.Map<ExpandoObject>(product);
+Console.WriteLine(expando.Code);
+```
+
+Hangi üyelerin dahil edileceğini `ShouldMapProperty` / `ShouldMapField` ile, anahtar adlarını ise bir type converter ile özelleştirebilirsiniz:
+
+```csharp
+CreateMap<Product, Dictionary<string, object?>>()
+    .ConvertUsing((src, _, _) => new Dictionary<string, object?> { ["code"] = src.Code, ["price"] = src.Price });
 ```
 
 ## ProjectTo ile
@@ -91,4 +88,4 @@ Kaynak türü bir sözlük olan eşlemeler [AssertConfigurationIsValid](./config
 
 ## AutoMapper uyumluluğu
 
-Sözlükten nesneye ve sözlükten sözlüğe eşleme AutoMapper ile aynı sonucu verir. Fark: AutoMapper bir nesneyi `IDictionary<string, object>` hedefine üye adlarıyla eşleyebilir; VeloxMapper 6.0.0'da bu yön için yukarıdaki gibi bir type converter gerekir. `ExpandoObject`/`dynamic` hedefler de desteklenmez.
+Sözlükten nesneye, nesneden sözlüğe (`IDictionary<string, object>`, `ExpandoObject`/`dynamic`) ve sözlükten sözlüğe eşleme AutoMapper ile aynı sonucu verir. `ExpandoObject` kaynaklar da (yalnızca `IDictionary<string, object>` uygulayan türler) sözlük olarak okunur.

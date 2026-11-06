@@ -29,3 +29,7 @@ nupkg/
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+
+## Yerel araç ayarları ve paket çıktıları
+.claude/settings.local.json
+artifacts/

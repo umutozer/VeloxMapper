@@ -18,6 +18,10 @@ public sealed class Mapper : IVeloxMapper
     [ThreadStatic]
     private static Stack<VeloxResolutionContext>? _contextPool;
 
+    /// <summary>Bu iş parçacığında şu anda yürütülen (en içteki) Map çağrısının bağlamı; iç içe çağrılar için.</summary>
+    [ThreadStatic]
+    private static VeloxResolutionContext? _currentContext;
+
     private readonly MapperConfiguration _configuration;
     private readonly IServiceProvider? _serviceProvider;
     private readonly Func<Type, object>? _serviceCtor;
@@ -281,12 +285,38 @@ public sealed class Mapper : IVeloxMapper
             context.State = options.State;
         }
 
+        // AutoMapper paritesi: bir resolver/converter/action içinden context.Mapper.Map(...) çağrıldığında dış çağrının
+        // Items, State, ServiceCtor ve referans önbelleği iç çağrıda da görünür (çağrıya özel seçenekler verilmişse onlar öncelikli).
+        var outer = _currentContext;
+        if (outer != null && ReferenceEquals(outer.Mapper, this))
+        {
+            if (options?.ItemsOrNull == null) context.SetItems(outer.ItemsOrNull);
+            if (options?.State == null) context.State = outer.State;
+            if (options?.ServiceCtor == null && outer.ServiceCtor != null) context.ServiceCtor = outer.ServiceCtor;
+            context.ReferenceCache = outer.ReferenceCache;
+            context.SharesOuterReferenceCache = outer.ReferenceCache != null;
+            context.CurrentDepth = outer.CurrentDepth;
+        }
+
+        context.Parent = outer;
+        _currentContext = context;
         return context;
     }
 
-    private static void Release(VeloxResolutionContext context)
+    private void Release(VeloxResolutionContext context)
     {
+        _currentContext = context.Parent as VeloxResolutionContext;
+        context.Parent = null;
+        if (context.SharesOuterReferenceCache)
+        {
+            // Paylaşılan önbellek dış bağlama aittir; burada temizlenmez.
+            context.ReferenceCache = null;
+            context.SharesOuterReferenceCache = false;
+        }
+
         context.Reset(context.Mapper, null);
+        // Kapsamlı (scoped) bir servis sağlayıcıya bağlı mapper'lar havuzlanmaz; aksi hâlde kapanmış DI kapsamları canlı kalır.
+        if (_serviceProvider != null) return;
         var pool = _contextPool ??= new Stack<VeloxResolutionContext>();
         if (pool.Count < 16) pool.Push(context);
     }

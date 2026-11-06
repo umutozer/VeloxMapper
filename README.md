@@ -139,6 +139,19 @@ dotnet test tests/VeloxMapper.Tests
 dotnet pack src/VeloxMapper/VeloxMapper.csproj -c Release -o artifacts
 ```
 
+## Yayın
+
+Paket, nuget.org **Trusted Publishing** ile GitHub Actions üzerinden yayınlanır; API anahtarı saklanmaz.
+`src/VeloxMapper/VeloxMapper.csproj` içindeki `<Version>` ile aynı adda bir etiket push etmek yeterlidir:
+
+```bash
+git tag v6.1.0
+git push origin v6.1.0
+```
+
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) derler, testleri çalıştırır, paketi üretir ve nuget.org'a gönderir.
+Web sitesi (`website/`) Netlify'da yayınlanır: https://veloxmapper-website.netlify.app
+
 ## Lisans
 
 [MIT](LICENSE) © 2026 Umut Özer

@@ -178,7 +178,7 @@ Paket, `[VeloxMap]` hedef türlerindeki kurucu belirsizliklerini derleme zamanı
 | Source generator ile üretilen metotlar | Düz C# kodu; reflection ve dinamik kod üretimi kullanmaz. |
 | Çalışma zamanı motoru (`Map`, `ProjectTo`) | Reflection ve `System.Linq.Expressions` kullanır. NativeAOT altında `LambdaExpression.Compile()` yorumlayıcı (interpreter) modunda çalışır; trimming, yalnızca reflection ile erişilen üyeleri kaldırabilir. |
 
-VeloxMapper 6.0.0 paketi trimming veya AOT uyumlu olarak işaretlenmemiştir. NativeAOT ile yayımlayacağınız bir uygulamada:
+VeloxMapper 6.1.0 paketi trimming veya AOT uyumlu olarak işaretlenmemiştir. NativeAOT ile yayımlayacağınız bir uygulamada:
 
 1. Sıcak yollardaki eşlemeleri `[VeloxMap]` ile üretip üretilen metotları doğrudan çağırın.
 2. Çalışma zamanı motorunu kullanmaya devam ettiğiniz eşlemeleri `PublishAot=true` ile yayımlanmış derlemede test edin ve derleyicinin trim/AOT uyarılarını inceleyin.

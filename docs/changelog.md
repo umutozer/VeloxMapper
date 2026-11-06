@@ -1,6 +1,6 @@
 ---
 title: "Sürüm Notları"
-description: "VeloxMapper sürümlerindeki yenilikleri, kırıcı değişiklikleri ve 5.x'ten 6.0'a yükseltme adımlarını inceleyin."
+description: "VeloxMapper sürümlerindeki yenilikleri, kırıcı değişiklikleri ve yükseltme adımlarını inceleyin."
 section: resources
 order: 30
 ---
@@ -8,6 +8,27 @@ order: 30
 # Sürüm Notları
 
 Bu sayfa VeloxMapper sürümleri arasındaki değişiklikleri listeler. Sürüm numaraları [Semantic Versioning](https://semver.org) kurallarını izler: ana sürüm değişikliği kırıcı değişiklik içerir.
+
+## 6.1.0 — 2026-11-05
+
+AutoMapper paritesini tamamlayan ve geçiş betiğini sağlamlaştıran sürüm. Kırıcı değişiklik yoktur; 6.0.0'dan paket sürümünü güncelleyerek geçilir.
+
+### Eklenenler
+
+- **`IMapperBase` arayüzü:** `IMapper` artık AutoMapper'daki gibi `IMapperBase`'den türer; `IMapperBase` parametresi alan kod derlenir.
+- **Nesneden sözlüğe eşleme:** Bir nesne `Dictionary<string, object>`, `IDictionary<string, object>`, `IDictionary` veya `ExpandoObject` hedefine yapılandırma gerekmeden eşlenir; `ExpandoObject` kaynaklar sözlük olarak okunur (AutoMapper ile aynı). Bkz. [Sözlük Eşleme](./dictionary-mapping.md).
+- **`IRuntimeMapper` arayüzü:** `ResolutionContext.Mapper` artık AutoMapper ile aynı şekilde `IRuntimeMapper` türündedir (`IMapper`'dan türer). `IRuntimeMapper` kullanan resolver ve action kodu değiştirilmeden derlenir.
+- **Geçiş betiği:** `*.razor` / `*.cshtml` dosyalarında `@using` ve `@inject` satırları güncellenir; `using AM = AutoMapper;` takma adları, `AutoMapper.AutoMapperMappingException` gibi tam nitelikli istisna adları ve `PrivateAssets` gibi ek nitelik içeren paket referansları dönüştürülür; yalnızca `AutoMapper.Extensions.Microsoft.DependencyInjection` paketine referans veren projelere `VeloxMapper` referansı eklenir; statik `Mapper.Initialize`/`Mapper.Map`, `AddCollectionMappers`, `AutoMapper.Internal` ve VB/F# dosyaları için gözden geçirme uyarıları eklendi. Çıkış kodu `1` yazılamayan dosya olduğunu bildirir.
+
+### Düzeltilenler
+
+- **İç içe `context.Mapper.Map(...)` çağrıları:** Resolver, converter veya action içinden başlatılan eşleme dış çağrının `Items`, `State`, `ConstructServicesUsing` fabrikası ve `PreserveReferences` önbelleğini devralır (AutoMapper davranışı). Önceki sürümde iç çağrı boş bir bağlamla başlıyordu.
+- **Varsayılan `Get` ön eki:** AutoMapper'daki gibi `GetName` adlı kaynak **property**'leri de `Name` hedef üyesine eşlenir (daha önce yalnızca `GetName()` metotları tanınıyordu).
+- **`null` string → `Nullable<enum>`:** Kaynak `null` ise hedef `null` kalır; önceki sürümde enum'un varsayılan değeri (0) atanıyordu. Aynı düzeltme tüm referans türü → `Nullable<T>` dönüşümleri için geçerlidir.
+- **`IncludeMembers` + `ReverseMap`:** `IncludeMembers(s => s.Alt)` tanımı ters yönde `ForPath(s => s.Alt, o => o.MapFrom(d => d))` olarak uygulanır (AutoMapper davranışı); daha önce ters eşlemede alt nesne `null` kalıyordu.
+- **DI kapsamı sızıntısı:** Kapsamlı (scoped) servis sağlayıcıya bağlı mapper'ların bağlam nesneleri artık iş parçacığı havuzunda tutulmaz; kapanmış DI kapsamları (ör. `DbContext`) gereksiz yere canlı kalmaz.
+- **Geçiş betiği:** String sabitleri ve yorumlar içindeki `AutoMapper` metinleri artık değiştirilmez; `My.Legacy.AutoMapper.X` gibi kullanıcı namespace'leri dokunulmaz; UTF-8/UTF-16 dışındaki kodlamalar bozulmaz (dosya atlanır ve raporlanır); salt okunur bir dosya çalışmayı yarıda kesmez; kaynak kod içeren `packages` klasörleri taranır.
+- **NuGet paketi:** 6.0.0 paketindeki derleme çıktıları geliştiricinin yerel klasör yolunu içeriyordu; paket artık deterministik derlenir (`/_/` yol maskesi).
 
 ## 6.0.0 — 2026-10-05
 

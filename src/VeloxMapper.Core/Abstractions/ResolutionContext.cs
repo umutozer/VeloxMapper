@@ -23,7 +23,7 @@ public class ResolutionContext
     /// <param name="mapper">Eşleştirmeyi yürüten mapper.</param>
     /// <param name="serviceProvider">Resolver/converter örneklerini çözmek için kullanılan servis sağlayıcı (isteğe bağlı).</param>
     /// <param name="items">Başlangıç <see cref="Items"/> sözlüğü (isteğe bağlı).</param>
-    public ResolutionContext(IMapper mapper, IServiceProvider? serviceProvider = null, IDictionary<string, object>? items = null)
+    public ResolutionContext(IRuntimeMapper mapper, IServiceProvider? serviceProvider = null, IDictionary<string, object>? items = null)
     {
         Mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
         ServiceProvider = serviceProvider;
@@ -34,7 +34,7 @@ public class ResolutionContext
     /// Eşleştirmeyi yürüten mapper. İç içe eşleştirmeler için kullanılabilir:
     /// <c>context.Mapper.Map&lt;AddressDto&gt;(source.Address)</c>.
     /// </summary>
-    public IMapper Mapper { get; internal set; }
+    public IRuntimeMapper Mapper { get; internal set; }
 
     /// <summary>
     /// Resolver, converter ve mapping action örneklerinin çözüldüğü servis sağlayıcı. DI dışında kullanımda <c>null</c> olabilir.
@@ -85,18 +85,29 @@ public class ResolutionContext
     /// <summary>Çağrı seçeneklerinden gelen öğe sözlüğünü bağlama atar.</summary>
     internal void SetItems(IDictionary<string, object>? items) => _items = items;
 
+    /// <summary>Oluşturulmuş öğe sözlüğü (yoksa <c>null</c>); iç içe çağrılara aktarım için.</summary>
+    internal IDictionary<string, object>? ItemsOrNull => _items;
+
+    /// <summary>Bu bağlamı başlatan dış <c>Map</c> çağrısının bağlamı (kök çağrı için <c>null</c>).</summary>
+    internal ResolutionContext? Parent { get; set; }
+
+    /// <summary><see cref="ReferenceCache"/> dış bağlamdan devralındıysa <c>true</c>; bu durumda sıfırlamada temizlenmez.</summary>
+    internal bool SharesOuterReferenceCache { get; set; }
+
     /// <summary>
     /// Bağlamı yeniden kullanım için sıfırlar.
     /// </summary>
-    internal void Reset(IMapper mapper, IServiceProvider? serviceProvider)
+    internal void Reset(IRuntimeMapper mapper, IServiceProvider? serviceProvider)
     {
         Mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
         ServiceProvider = serviceProvider;
         _items = null;
         State = null;
         CurrentDepth = 0;
-        ReferenceCache?.Clear();
+        if (!SharesOuterReferenceCache) ReferenceCache?.Clear();
         ReferenceCache = null;
+        SharesOuterReferenceCache = false;
+        Parent = null;
         CurrentMember = null;
         ServiceCtor = null;
     }

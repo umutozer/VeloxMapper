@@ -19,7 +19,7 @@ Bu rehberde sipariş (Order) ve müşteri (Customer) varlıklarını DTO'lara e�
 ```bash
 dotnet new web -n Shop
 cd Shop
-dotnet add package VeloxMapper --version 6.0.0
+dotnet add package VeloxMapper --version 6.1.0
 dotnet add package Microsoft.EntityFrameworkCore.InMemory
 ```
 

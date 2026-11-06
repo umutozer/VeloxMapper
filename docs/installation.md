@@ -14,14 +14,14 @@ VeloxMapper tek bir NuGet paketi olarak dağıtılır. Çalışma zamanı motoru
 .NET CLI ile:
 
 ```bash
-dotnet add package VeloxMapper --version 6.0.0
+dotnet add package VeloxMapper --version 6.1.0
 ```
 
 Proje dosyasına doğrudan eklemek için:
 
 ```xml title="Shop.Api.csproj"
 <ItemGroup>
-  <PackageReference Include="VeloxMapper" Version="6.0.0" />
+  <PackageReference Include="VeloxMapper" Version="6.1.0" />
 </ItemGroup>
 ```
 
@@ -29,7 +29,7 @@ Merkezi paket yönetimi (Central Package Management) kullanıyorsanız sürümü
 
 ```xml title="Directory.Packages.props"
 <ItemGroup>
-  <PackageVersion Include="VeloxMapper" Version="6.0.0" />
+  <PackageVersion Include="VeloxMapper" Version="6.1.0" />
 </ItemGroup>
 ```
 
@@ -85,7 +85,7 @@ Kurulan sürümü kodda okuyabilirsiniz:
 ```csharp
 using VeloxMapper.Diagnostics;
 
-Console.WriteLine(VeloxVersion.Current); // 6.0.0
+Console.WriteLine(VeloxVersion.Current); // 6.1.0
 ```
 
 ## AutoMapper'dan geliyorsanız
@@ -95,7 +95,7 @@ AutoMapper paketlerini kaldırıp VeloxMapper'ı ekleyin:
 ```bash
 dotnet remove package AutoMapper
 dotnet remove package AutoMapper.Extensions.Microsoft.DependencyInjection
-dotnet add package VeloxMapper --version 6.0.0
+dotnet add package VeloxMapper --version 6.1.0
 ```
 
 Bu adımı ve `using` değişikliklerini elle yapmak yerine [otomatik geçiş betiğini](./migration-script.md) kullanmanızı öneririz. Sürecin tamamı için [Geçiş Rehberi](./migration-guide.md)'ne bakın.

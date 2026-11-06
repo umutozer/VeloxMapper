@@ -237,6 +237,8 @@ ForMember yalnızca hedef türün doğrudan üyelerini kabul eder ('d => d.Custo
 | `CS0104` / `CS0121` belirsizlik | AutoMapper paketi hâlâ referans ediliyor (doğrudan veya transitif) | `dotnet list package --include-transitive` ile bulup kaldırın. |
 | `'Internal'`, `'UseAsDataSource'`, `'EqualityComparison'` tanımlı değil | Desteklenmeyen API | Bkz. [Davranış Farkları](./behavior-differences.md#desteklenmeyen-apiler). |
 | `CS8198` / `CS0834` (ifade ağacı hataları) `ConvertUsing` veya `ValueTransformers.Add` içinde | Bu API'ler `Expression<Func<...>>` alır; lambda ifade gövdeli olmalı | Blok gövdeli lambdaları ifadeye çevirin veya `ConvertUsing((src, dest) => ...)` overload'unu kullanın. |
+| `CS0104: IConfigurationProvider belirsiz başvuru` (`VeloxMapper` ve `Microsoft.Extensions.Configuration`) | ASP.NET Core projelerinde `Microsoft.Extensions.Configuration` örtük olarak içe alınır; AutoMapper ile de aynı çakışma yaşanır | `using IConfigurationProvider = VeloxMapper.IConfigurationProvider;` takma adı ekleyin veya `mapper.ConfigurationProvider` kullanın. |
+| `INamingConvention` bulunamadı | AutoMapper'ın özel isimlendirme kuralı arayüzü yok | `VeloxMapper.Abstractions.ICustomNamingConvention` (`Normalize`) uygulayın; bkz. [İsimlendirme Kuralları](./naming-conventions.md#özel-kural-yazmak). |
 
 Geçiş sürecinin tamamı için [Geçiş Rehberi](./migration-guide.md)'ne bakın.
 

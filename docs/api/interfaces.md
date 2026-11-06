@@ -104,7 +104,7 @@ Resolver, converter, action, koşul ve fonksiyon tabanlı `MapFrom` çağrılar�
 ```csharp
 public class ResolutionContext
 {
-    public IMapper Mapper { get; }
+    public IRuntimeMapper Mapper { get; }
     public IServiceProvider? ServiceProvider { get; }
     public IDictionary<string, object> Items { get; }
     public object? State { get; set; }
@@ -125,7 +125,7 @@ public class ResolutionContext
 > [!IMPORTANT]
 > Bağlam örnekleri motor tarafından havuzlanır ve yeniden kullanılır. Bir `Map` çağrısı tamamlandıktan sonra bağlama veya `Items` sözlüğüne referans tutmayın.
 
-`context.Mapper.Map(...)` ile resolver içinden başlatılan eşleme yeni bir bağlam kullanır; dış çağrının `Items` sözlüğü iç çağrıya aktarılmaz. Gerekiyorsa iç çağrıya `opt => opt.Items[...]` ile tekrar verin.
+`context.Mapper.Map(...)` ile resolver, converter veya action içinden başlatılan eşleme dış çağrının bağlamını devralır: `Items`, `State`, `ConstructServicesUsing` fabrikası ve `PreserveReferences` önbelleği iç çağrıda da geçerlidir (AutoMapper ile aynı). İç çağrıya `opt => opt.Items[...]` ile kendi seçeneklerini verirseniz onlar kullanılır.
 
 AutoMapper ile aynı ad ve üyeler. Fark: AutoMapper'da seçenek verilmeden `Items`'a erişmek hata fırlatır.
 

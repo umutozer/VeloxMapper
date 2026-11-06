@@ -69,7 +69,7 @@ Proje dosyasında:
 <PackageReference Include="AutoMapper.Extensions.Microsoft.DependencyInjection" Version="12.0.1" />
 ```
 ```xml title="VeloxMapper"
-<PackageReference Include="VeloxMapper" Version="6.0.0" />
+<PackageReference Include="VeloxMapper" Version="6.1.0" />
 ```
 <!-- /tabs -->
 

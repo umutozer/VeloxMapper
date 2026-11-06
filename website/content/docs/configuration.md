@@ -158,7 +158,7 @@ Birleştirme kuralları AutoMapper ile aynıdır:
 | `SourceMemberNamingConvention`, `DestinationMemberNamingConvention` | yok | Ad dönüştürme kuralı. Bkz. [Konvansiyonlar](./conventions.md#adlandırma-kuralları). |
 | `RecognizePrefixes`, `RecognizePostfixes` | yok | Kaynak üye adlarındaki ön/son ekleri yok sayar. |
 | `RecognizeDestinationPrefixes`, `RecognizeDestinationPostfixes` | yok | Hedef üye adlarındaki ön/son ekleri yok sayar. |
-| `ClearPrefixes()` | — | Tanımlı ön ekleri ve varsayılan `Get` metot ön ekini temizler. |
+| `ClearPrefixes()` | — | Tanımlı ön ekleri ve varsayılan `Get` ön ekini (metot ve property) temizler. |
 | `ReplaceMemberName(original, newValue)` | yok | Kaynak üye adında karakter/metin değişimi yapar (ör. `"Ü"` → `"U"`). |
 | `AddGlobalIgnore(prefix)` | yok | Adı bu metinle başlayan hedef üyeleri yok sayar. |
 | `ShouldMapProperty` | getter veya setter'ı public olanlar | Hangi property'lerin eşleneceğini belirler. |
