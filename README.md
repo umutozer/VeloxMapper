@@ -141,15 +141,12 @@ dotnet pack src/VeloxMapper/VeloxMapper.csproj -c Release -o artifacts
 
 ## Yayın
 
-Paket, nuget.org **Trusted Publishing** ile GitHub Actions üzerinden yayınlanır; API anahtarı saklanmaz.
-`src/VeloxMapper/VeloxMapper.csproj` içindeki `<Version>` ile aynı adda bir etiket push etmek yeterlidir:
+Paket elle yayınlanır; CI/CD veya otomatik yayın yoktur.
 
-```bash
-git tag v6.1.0
-git push origin v6.1.0
-```
+1. Sürüm numarasını güncelleyin (`src/VeloxMapper/VeloxMapper.csproj` ve `src/VeloxMapper.Core/VeloxMapper.Core.csproj` içindeki `<Version>`, `VeloxVersion.Current`, `website/src/lib/version.ts`, dokümanlar ve sürüm notları).
+2. Paketi üretin: `dotnet pack src/VeloxMapper/VeloxMapper.csproj -c Release -o artifacts`
+3. Oluşan `artifacts/VeloxMapper.<sürüm>.nupkg` dosyasını https://www.nuget.org/packages/manage/upload sayfasından yükleyin.
 
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml) derler, testleri çalıştırır, paketi üretir ve nuget.org'a gönderir.
 Web sitesi (`website/`) Netlify'da yayınlanır: https://veloxmapper-website.netlify.app
 
 ## Lisans
