@@ -1,0 +1,10 @@
+<Project>
+  <!--
+    Yeniden üretilebilir (deterministic) derleme: DLL ve PDB içine geliştiricinin yerel klasör yolu
+    (ör. C:\Users\...) yazılmaz; kaynak yolları /_/ olarak maskelenir.
+  -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
+  </PropertyGroup>
+</Project>
